@@ -8,11 +8,21 @@ S3_ENDPOINT_URL = "https://" + os.environ["AWS_S3_ENDPOINT"]
 fs = s3fs.S3FileSystem(client_kwargs={'endpoint_url': S3_ENDPOINT_URL})
 
 BUCKET = "projet-datalab-depp-dgfip/"
-FILE_KEY_S3 = "diane_usage_daily_with_models_2026-01-28 (1).csv"
-FILE_PATH_S3 = BUCKET + "/" + FILE_KEY_S3
+FILE_KEY_S3_energy = "Energy_Data_Clean.csv"
+FILE_PATH_S3_energy = BUCKET + "/" + FILE_KEY_S3_energy
 
-with fs.open(FILE_PATH_S3, mode="rb") as file_in:
-    df = pd.read_csv(file_in, sep=",")
+with fs.open(FILE_KEY_S3_energy, mode="rb") as file_in:
+    df_energy = pd.read_csv(file_in)
+
+print(df_energy.columns)
+print(df_energy.shape)
+
+BUCKET = "projet-datalab-depp-dgfip/"
+FILE_KEY_S3_model = "diane_usage_daily_with_models_2026-01-28 (1).csv"
+FILE_PATH_S3_model = BUCKET + "/" + FILE_KEY_S3_model
+
+with fs.open(FILE_KEY_S3_model, mode="rb") as file_in:
+    df_model = pd.read_csv(file_in)
 
 folder_path = "/home/onyxia/work/energy_score_data_02_26/*.csv"
 
@@ -29,41 +39,41 @@ aie_models = pd.concat(aie_models, ignore_index=True)
 
 aie_models[['Company', 'model_name']] = aie_models['model'].str.split('/', expand=True)
 
-df.loc[df['Model'] == "Llama-3-3-70B-128k", 'Task'] = 'Text_Generation'
+df_model.loc[df_model['Model'] == "Llama-3-3-70B-128k", 'Task'] = 'Text_Generation'
 URL = 'https://huggingface.co/meta-llama/Meta-Llama-3-70B'
-df.loc[df['Model'] == 'Llama-3-3-70B-128k', 'HF_URL'] = URL
+df_model.loc[df_model['Model'] == 'Llama-3-3-70B-128k', 'HF_URL'] = URL
 
-df.loc[df['Model'] == "gptoss120b", 'Task'] = 'Reasoning'
+df_model.loc[df_model['Model'] == "gptoss120b", 'Task'] = 'Reasoning'
 URL = 'https://huggingface.co/openai/gpt-oss-120b'
-df.loc[df['Model'] == 'gptoss120b', 'HF_URL'] = URL
+df_model.loc[df_model['Model'] == 'gptoss120b', 'HF_URL'] = URL
 
-df.loc[df['Model'] == "gptoss20b", 'Task'] = 'Reasoning'
+df_model.loc[df_model['Model'] == "gptoss20b", 'Task'] = 'Reasoning'
 URL = "https://huggingface.co/openai/gpt-oss-20b"
-df.loc[df['Model'] == 'gptoss20b', 'HF_URL'] = URL
+df_model.loc[df_model['Model'] == 'gptoss20b', 'HF_URL'] = URL
 
-df.loc[df['Model'] == '/model/deepdml-faster-whisper-large-v3-turbo-ct2', 'Task'] = 'Automatic_Speech_Recognition'
+df_model.loc[df_model['Model'] == '/model/deepdml-faster-whisper-large-v3-turbo-ct2', 'Task'] = 'Automatic_Speech_Recognition'
 URL = 'https://huggingface.co/deepdml/faster-whisper-large-v3-turbo-ct2'
-df.loc[df['Model'] == '/model/deepdml-faster-whisper-large-v3-turbo-ct2', 'HF_URL'] = URL
+df_model.loc[df_model['Model'] == '/model/deepdml-faster-whisper-large-v3-turbo-ct2', 'HF_URL'] = URL
 
-df.loc[df['Model'] == 'Qwen2.5-Coder-32B-Instruct-fp8-W8A16', 'Task'] = 'Text_Generation'
+df_model.loc[df_model['Model'] == 'Qwen2.5-Coder-32B-Instruct-fp8-W8A16', 'Task'] = 'Text_Generation'
 URL = 'https://huggingface.co/Qwen/Qwen2.5-Coder-32B-Instruct'
-df.loc[df['Model'] == 'Qwen2.5-Coder-32B-Instruct-fp8-W8A16', 'HF_URL'] = URL
+df_model.loc[df_model['Model'] == 'Qwen2.5-Coder-32B-Instruct-fp8-W8A16', 'HF_URL'] = URL
 
-df.loc[df['Model'] == 'gte-Qwen2-1-5B-instruct', 'Task'] = 'Sentence_Similarity'
+df_model.loc[df_model['Model'] == 'gte-Qwen2-1-5B-instruct', 'Task'] = 'Sentence_Similarity'
 URL = 'https://huggingface.co/Alibaba-NLP/gte-Qwen2-1.5B-instruct'
-df.loc[df['Model'] == 'gte-Qwen2-1-5B-instruct', 'HF_URL'] = URL
+df_model.loc[df_model['Model'] == 'gte-Qwen2-1-5B-instruct', 'HF_URL'] = URL
 
-df.loc[df['Model'] == 'Mistral-Small-24B-Instruct-2501-FP8-dynamic', 'Task'] = 'Reasoning'
+df_model.loc[df_model['Model'] == 'Mistral-Small-24B-Instruct-2501-FP8-dynamic', 'Task'] = 'Reasoning'
 URL = 'https://huggingface.co/mistralai/Mistral-Small-24B-Instruct-2501'
-df.loc[df['Model'] == 'Mistral-Small-24B-Instruct-2501-FP8-dynamic', 'HF_URL'] = URL
+df_model.loc[df_model['Model'] == 'Mistral-Small-24B-Instruct-2501-FP8-dynamic', 'HF_URL'] = URL
 
-df.loc[df['Model'] == 'dgfip-e5-large', 'Task'] = 'Sentence_Similarity'
+df_model.loc[df_model['Model'] == 'dgfip-e5-large', 'Task'] = 'Sentence_Similarity'
 URL = 'https://huggingface.co/intfloat/e5-large'
-df.loc[df['Model'] == 'dgfip-e5-large', 'HF_URL'] = URL
+df_model.loc[df_model['Model'] == 'dgfip-e5-large', 'HF_URL'] = URL
 
-df['AIE_name'] = df['HF_URL'].str.split("/").str[-1]
+df_model['AIE_name'] = df_model['HF_URL'].str.split("/").str[-1]
 
-model_data = df.merge(aie_models, left_on='AIE_name', right_on='model_name', how='left')
+model_data = df_model.merge(aie_models, left_on='AIE_name', right_on='model_name', how='left')
 
 model_data['Date'] = pd.to_datetime(model_data['Date'], errors='coerce')
 
