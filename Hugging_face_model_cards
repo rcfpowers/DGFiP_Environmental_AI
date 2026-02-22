@@ -1,0 +1,159 @@
+"""
+policy_in_action.py
+-------------------
+Scrapes Hugging Face Hub for models matching a search term and builds:
+  - df              : main DataFrame with metadata, eval scores, emissions, etc.
+  - fine_tune_df    : edge list of base_model → derived_model relationships
+
+Requirements:
+    pip install huggingface_hub pandas
+"""
+
+import warnings
+import re
+import pandas as pd
+from huggingface_hub import HfApi, ModelCard
+
+warnings.filterwarnings("ignore")
+
+# ── Config ────────────────────────────────────────────────────────────────────
+SEARCH_TERM = "bert"
+LIMIT = 100
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def safe_get(obj, *attrs):
+    """Return the first attribute that exists on obj, or None."""
+    for attr in attrs:
+        if hasattr(obj, attr):
+            return getattr(obj, attr)
+    return None
+
+
+def extract_section(text: str, section_name: str):
+    """Extract a markdown section by heading name."""
+    pattern = rf"##+ {section_name}.*?(?=\n##|\Z)"
+    match = re.search(pattern, text, re.DOTALL | re.IGNORECASE)
+    return match.group(0).strip() if match else None
+
+
+# ── Fetch models ──────────────────────────────────────────────────────────────
+api = HfApi()
+
+models = list(api.list_models(
+    search=SEARCH_TERM,
+    limit=LIMIT,
+    expand=[
+        "cardData",
+        "downloads",
+        "downloadsAllTime",
+        "likes",
+        "pipeline_tag",
+        "tags",
+        "createdAt",
+        "lastModified",
+        "library_name",
+        "gated",
+        "private",
+        "sha",
+        "siblings",
+        "safetensors",
+        "transformersInfo",
+        "baseModels",
+        "inferenceProviderMapping",
+        "spaces",
+        "trendingScore",
+    ],
+))
+
+# ── Build records ─────────────────────────────────────────────────────────────
+records = []
+fine_tune_edges = []
+
+for model in models:
+    card = model.cardData if model.cardData else {}
+    model_id = model.id
+    author = model_id.split("/")[0]
+
+    # Timestamps — attribute name varies across SDK versions
+    created_at = safe_get(model, "created_at", "createdAt")
+    last_modified = safe_get(model, "last_modified", "lastModified")
+
+    # README sections
+    try:
+        card_obj = ModelCard.load(model_id)
+        readme = card_obj.content
+    except Exception:
+        readme = None
+
+    environmental_section = extract_section(readme, "Environmental") if readme else None
+    bias_section = extract_section(readme, "Bias") if readme else None
+
+    # Eval scores from model-index
+    eval_scores = []
+    model_index = card.get("model-index")
+    if model_index:
+        for entry in model_index:
+            for result in entry.get("results", []):
+                for metric in result.get("metrics", []):
+                    eval_scores.append({
+                        "metric": metric.get("name"),
+                        "value": metric.get("value"),
+                    })
+
+    # Fine-tuning graph edges
+    base_models = safe_get(model, "baseModels")
+    if base_models:
+        for base in base_models:
+            fine_tune_edges.append({
+                "base_model": base,
+                "derived_model": model_id,
+            })
+
+    # File stats
+    siblings = safe_get(model, "siblings")
+    file_count = len(siblings) if siblings else None
+    model_size_estimate = None
+    if siblings:
+        sizes = [s.size for s in siblings if hasattr(s, "size") and s.size]
+        if sizes:
+            model_size_estimate = sum(sizes) / (1024 ** 2)  # MB
+
+    records.append({
+        "model_id": model_id,
+        "author": author,
+        "downloads_30d": safe_get(model, "downloads"),
+        "downloads_all_time": safe_get(model, "downloadsAllTime"),
+        "likes": safe_get(model, "likes"),
+        "task": safe_get(model, "pipeline_tag"),
+        "library": safe_get(model, "library_name"),
+        "created_at": created_at,
+        "last_modified": last_modified,
+        "license": card.get("license"),
+        "datasets": card.get("datasets"),
+        "language": card.get("language"),
+        "emissions": card.get("carbon_emissions") or card.get("co2_eq_emissions"),
+        "gated": safe_get(model, "gated"),
+        "private": safe_get(model, "private"),
+        "uses_safetensors": safe_get(model, "safetensors"),
+        "file_count": file_count,
+        "model_size_MB_est": model_size_estimate,
+        "inference_providers": safe_get(model, "inferenceProviderMapping"),
+        "spaces_using_model": safe_get(model, "spaces"),
+        "trending_score": safe_get(model, "trendingScore"),
+        "eval_scores": eval_scores,
+        "environmental_section": environmental_section,
+        "bias_section": bias_section,
+    })
+
+# ── DataFrames ────────────────────────────────────────────────────────────────
+df = pd.DataFrame(records)
+fine_tune_df = pd.DataFrame(fine_tune_edges)
+
+# ── Output ────────────────────────────────────────────────────────────────────
+print(f"Models fetched : {len(df)}")
+print(f"Fine-tune edges: {len(fine_tune_df)}")
+print("\n--- Models (first 5) ---")
+print(df.head().to_string())
+print("\n--- Fine-tune edges (first 5) ---")
+print(fine_tune_df.head().to_string())
