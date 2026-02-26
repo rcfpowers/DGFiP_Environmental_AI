@@ -1,0 +1,540 @@
+#Estimates how much energy and CO₂ each LLM model consumed on the DIANE platform between October and December 2025. 
+It pulls usage data (tokens, requests) and GPU power measurements from our shared S3 bucket, 
+looks up model sizes on HuggingFace, and splits total cluster energy across models proportionally to their computational load. 
+Results include energy per model (kWh), carbon footprint (kg CO₂), and efficiency metrics (Wh per request, kWh per million tokens). 
+Run it directly on Onyxia — credentials and S3 endpoint are picked up automatically from the environment.#
+"""
+DIANE Energy Analysis – Per-Model Energy & CO₂ Estimation
+==========================================================
+This script estimates how much energy and CO₂ each LLM model consumed
+on the DIANE platform. It pulls usage data (tokens, requests) and GPU
+power measurements from our shared S3 bucket, looks up model sizes on
+HuggingFace, and splits total cluster energy across models proportionally
+to their computational load.
+
+Results include:
+  - Energy per model (kWh), carbon footprint (kg CO₂)
+  - Efficiency metrics: Wh per request, kWh per million tokens
+  - Two uptime scenarios (optimistic vs pessimistic) to reflect
+    uncertainty about when the cluster is actually running
+
+Run directly on Onyxia — S3 credentials are picked up automatically
+from the environment (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY,
+AWS_SESSION_TOKEN, S3_ENDPOINT).
+
+Usage:
+  python diane_energy_analysis.py
+  python diane_energy_analysis.py --no-hf       # skip HuggingFace lookup
+  python diane_energy_analysis.py --no-export   # do not write results to S3
+"""
+
+# ==============================================================================
+# 0. Install dependencies
+# ==============================================================================
+import subprocess, sys
+
+def install():
+    pkgs = ["pandas", "numpy", "matplotlib", "huggingface_hub", "boto3", "s3fs"]
+    print("Installing dependencies...")
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet"] + pkgs)
+    print("OK\n")
+
+install()
+
+import argparse
+import os
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+import s3fs
+
+# ==============================================================================
+# 1. Configuration
+# ==============================================================================
+
+S3_BUCKET   = "projet-datalab-depp-dgfip"
+USAGE_FILES = ["diane_usage_daily_with_models_2026-01-28 (1).csv"]
+ENERGY_FILE = "Energy_Data_Clean.csv"
+OUTPUT_CSV  = "energy_per_model_results.csv"
+
+PUE        = 1.7    # Power Usage Effectiveness of the datacenter
+CO2_FACTOR = 0.052  # kg CO2e / kWh (France, RTE 2024)
+
+# Model parameter counts (billions).
+# Priority: HuggingFace safetensors > values below > excluded from results.
+MODEL_PARAMS_B_KNOWN = {
+    # Retrieved from HuggingFace safetensors
+    "gte-Qwen2-1-5B-instruct":                          1.776,
+    "Qwen2.5-Coder-32B-Instruct-fp8-W8A16":            32.764,
+    # From official vendor documentation
+    "Llama-3-3-70B-128k":                               70.0,
+    "Mistral-Small-24B-Instruct-2501-FP8-dynamic":      24.0,
+    "/model/deepdml-faster-whisper-large-v3-turbo-ct2":  0.809,
+    # Internal models – inferred from model name
+    "gptoss20b":                                         20.0,
+    "gptoss120b":                                       120.0,
+    # Fine-tune of microsoft/e5-large
+    "dgfip-e5-large":                                    0.335,
+}
+
+# Mapping from model name (as it appears in the CSV) to HuggingFace repo.
+# None = internal model, not available on HuggingFace.
+MODEL_HF_REPO = {
+    "gte-Qwen2-1-5B-instruct":                         "Alibaba-NLP/gte-Qwen2-1.5B-instruct",
+    "Qwen2.5-Coder-32B-Instruct-fp8-W8A16":            "Qwen/Qwen2.5-Coder-32B-Instruct",
+    "Llama-3-3-70B-128k":                              "meta-llama/Llama-3.3-70B-Instruct",
+    "Mistral-Small-24B-Instruct-2501-FP8-dynamic":     "mistralai/Mistral-Small-24B-Instruct-2501",
+    "/model/deepdml-faster-whisper-large-v3-turbo-ct2": "deepdml/faster-whisper-large-v3-turbo-ct2",
+    "qwen3vl32binstruct":                               "Qwen/Qwen2.5-VL-32B-Instruct",
+    "gptoss20b":        None,
+    "gptoss120b":       None,
+    "dgfip-e5-large":   None,
+}
+
+# ==============================================================================
+# 2. S3 connection
+# ==============================================================================
+
+def get_fs():
+    """
+    Connect to S3 using credentials injected by Onyxia into the environment.
+    Variables: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN,
+               S3_ENDPOINT, AWS_DEFAULT_REGION.
+    """
+    endpoint = os.environ.get("S3_ENDPOINT") or os.environ.get("AWS_S3_ENDPOINT")
+    if not endpoint:
+        raise EnvironmentError(
+            "S3_ENDPOINT not found. Run this script from an Onyxia service "
+            "or set the environment variable manually."
+        )
+    return s3fs.S3FileSystem(
+        key=os.environ.get("AWS_ACCESS_KEY_ID"),
+        secret=os.environ.get("AWS_SECRET_ACCESS_KEY"),
+        token=os.environ.get("AWS_SESSION_TOKEN"),
+        endpoint_url=endpoint,
+        client_kwargs={"region_name": os.environ.get("AWS_DEFAULT_REGION", "us-east-1")},
+    )
+
+# ==============================================================================
+# 3. Model parameter lookup via HuggingFace
+# ==============================================================================
+
+def fetch_hf_params(model_name, hf_repo):
+    """
+    Query HuggingFace Hub for the exact number of parameters.
+    Returns value in billions, or None if not found.
+    Sources checked in order: safetensors metadata → config.
+    """
+    try:
+        from huggingface_hub import HfApi
+        info = HfApi().model_info(hf_repo)
+        if info.safetensors and info.safetensors.total:
+            p = info.safetensors.total / 1e9
+            print(f"  [HF]   {model_name}: {p:.3f}B (safetensors)")
+            return p
+        config = getattr(info, "config", None) or {}
+        if "num_parameters" in config:
+            p = config["num_parameters"] / 1e9
+            print(f"  [HF]   {model_name}: {p:.3f}B (config)")
+            return p
+        print(f"  [--]   {model_name}: no parameter data on HF ({hf_repo})")
+        return None
+    except Exception as e:
+        print(f"  [ERR]  {model_name}: HF error → {e}")
+        return None
+
+
+def build_params_map(models, use_hf):
+    """
+    Build a {model_name: params_B} map for all models in the dataset.
+
+    Priority for each model:
+      1. HuggingFace Hub (if use_hf=True and repo is mapped)
+      2. MODEL_PARAMS_B_KNOWN (manually verified values)
+      3. Excluded – no value invented, results will show NaN
+    """
+    params_map = {}
+    excluded = []
+    for model in sorted(models):
+        hf_repo = MODEL_HF_REPO.get(model)
+        if use_hf and hf_repo:
+            val = fetch_hf_params(model, hf_repo)
+            if val is not None:
+                params_map[model] = val
+                continue
+        if model in MODEL_PARAMS_B_KNOWN:
+            src = "known" if not hf_repo else "known (HF has no safetensors)"
+            print(f"  [OK]   {model}: {MODEL_PARAMS_B_KNOWN[model]}B ({src})")
+            params_map[model] = MODEL_PARAMS_B_KNOWN[model]
+            continue
+        reason = "internal model" if not hf_repo else "not found on HF"
+        print(f"  [SKIP] {model}: excluded ({reason})")
+        excluded.append(model)
+    return params_map, excluded
+
+# ==============================================================================
+# 4. Load data from S3
+# ==============================================================================
+
+def load_usage(fs, bucket, files):
+    """Load and concatenate usage CSV files from S3."""
+    dfs = []
+    for f in files:
+        print(f"  Reading: s3://{bucket}/{f}")
+        with fs.open(f"{bucket}/{f}") as fh:
+            dfs.append(pd.read_csv(fh))
+    usage = pd.concat(dfs, ignore_index=True)
+    usage.columns = usage.columns.str.strip()
+    usage["Date"]         = pd.to_datetime(usage["Date"])
+    usage["Total Tokens"] = pd.to_numeric(usage["Total Tokens"], errors="coerce").fillna(0)
+    usage["Requests"]     = pd.to_numeric(usage["Requests"],     errors="coerce").fillna(0)
+    usage["Spend ($)"]    = pd.to_numeric(usage["Spend ($)"],    errors="coerce").fillna(0)
+    return usage
+
+
+def load_energy(fs, bucket, energy_file):
+    """Load GPU power measurements from S3."""
+    print(f"  Reading: s3://{bucket}/{energy_file}")
+    with fs.open(f"{bucket}/{energy_file}") as fh:
+        df = pd.read_csv(fh)
+    df["Input Active Power Total (W)"] = pd.to_numeric(
+        df["Input Active Power Total (W)"], errors="coerce"
+    )
+    df["Datetime"] = pd.to_datetime(df["Datetime"], utc=True)
+    return df
+
+# ==============================================================================
+# 5. Energy calculations
+# ==============================================================================
+
+def compute(usage, energy, params_map, excluded):
+    """
+    Compute energy and CO2 per model.
+
+    Method:
+      - Cluster power: average of PDU readings across all 6 GPU nodes
+      - Total energy: cluster_power × 24h × uptime_days
+      - Uptime uncertainty: two scenarios shown side by side
+          · Optimistic  – only days with recorded requests (cluster off otherwise)
+          · Pessimistic – full calendar range (cluster always on)
+          · Central     – average of the two
+      - Energy per model: proportional to compute weight = tokens × params_B
+        (proxy for FLOPs: more parameters = more matrix multiplications per token)
+      - CO2: energy_facility × CO2_FACTOR  (facility = IT energy × PUE)
+
+    Limitations:
+      - PDU measurement covers only 80 minutes (3 Dec 2025) – assumed representative
+      - PUE = 1.7 is a standard estimate; real datacenter value unknown
+      - Compute weight is a proxy, not a direct measurement
+      - Models excluded due to missing parameter data are not estimated
+    """
+    # Cluster power from PDU readings
+    power_per_gpu   = energy.groupby("GPU")["Input Active Power Total (W)"].mean()
+    cluster_power_w = power_per_gpu.sum()
+
+    # Uptime scenarios
+    dates_with_data    = usage["Date"].drop_duplicates().sort_values()
+    n_days_optimistic  = len(dates_with_data)
+    n_days_pessimistic = (dates_with_data.max() - dates_with_data.min()).days + 1
+
+    def kwh(days): return cluster_power_w * 24 * days / 1000
+
+    energy_it = {
+        "optimistic":  kwh(n_days_optimistic),
+        "central":     kwh((n_days_optimistic + n_days_pessimistic) / 2),
+        "pessimistic": kwh(n_days_pessimistic),
+    }
+    energy_fac = {k: v * PUE for k, v in energy_it.items()}
+
+    # Aggregate usage by model
+    agg = usage.groupby("Model").agg(
+        total_requests=("Requests",     "sum"),
+        total_tokens  =("Total Tokens", "sum"),
+        total_spend   =("Spend ($)",    "sum"),
+        active_days   =("Date",         "nunique"),
+    ).reset_index()
+
+    agg["params_B"]      = agg["Model"].map(params_map)
+    agg["params_source"] = agg["params_B"].apply(
+        lambda x: "Known" if pd.notna(x) else "MISSING"
+    )
+
+    # Compute weight and energy share (only for models with known params)
+    known = agg["params_B"].notna()
+    agg.loc[known, "weight"]  = agg.loc[known, "total_tokens"] * agg.loc[known, "params_B"]
+    total_weight              = agg.loc[known, "weight"].sum()
+    agg.loc[known, "share"]   = agg.loc[known, "weight"] / total_weight
+
+    # Energy and CO2 for each scenario
+    for scenario in ["optimistic", "central", "pessimistic"]:
+        agg.loc[known, f"energy_fac_kWh_{scenario}"] = (
+            agg.loc[known, "share"] * energy_fac[scenario]
+        )
+        agg.loc[known, f"co2_kg_{scenario}"] = (
+            agg.loc[known, f"energy_fac_kWh_{scenario}"] * CO2_FACTOR
+        )
+
+    # Central scenario as default columns + efficiency metrics
+    agg.loc[known, "energy_fac_kWh"] = agg.loc[known, "energy_fac_kWh_central"]
+    agg.loc[known, "co2_kg"]         = agg.loc[known, "co2_kg_central"]
+    agg.loc[known, "kWh_per_1M_tok"] = (
+        agg.loc[known, "energy_fac_kWh"] / (agg.loc[known, "total_tokens"] / 1e6)
+    )
+    agg.loc[known, "Wh_per_req"]     = (
+        agg.loc[known, "energy_fac_kWh"] * 1000 / agg.loc[known, "total_requests"]
+    )
+    agg.loc[known, "gCO2_per_req"]   = agg.loc[known, "Wh_per_req"] * CO2_FACTOR
+
+    agg = agg.sort_values(
+        "energy_fac_kWh", ascending=False, na_position="last"
+    ).reset_index(drop=True)
+
+    uptime = {
+        "n_days_optimistic":   n_days_optimistic,
+        "n_days_pessimistic":  n_days_pessimistic,
+        **{f"energy_it_{k}":  v for k, v in energy_it.items()},
+        **{f"energy_fac_{k}": v for k, v in energy_fac.items()},
+    }
+
+    return agg, power_per_gpu, cluster_power_w, uptime
+
+# ==============================================================================
+# 6. Plots
+# ==============================================================================
+
+def short(name):
+    """Shorten model names for chart labels."""
+    return (name.replace("/model/", "")
+                .replace("-Instruct", "").replace("-instruct", "")
+                .replace("-fp8-W8A16", "").replace("-FP8-dynamic", "")
+                .replace("-2501", ""))
+
+
+def plot_power_realtime(energy):
+    """Plot real-time GPU power from PDU readings."""
+    fig, ax = plt.subplots(figsize=(13, 4))
+    for gpu in sorted(energy["GPU"].unique()):
+        sub = energy[energy["GPU"] == gpu].sort_values("Datetime")
+        ax.plot(sub["Datetime"], sub["Input Active Power Total (W)"],
+                linewidth=1.5, label=gpu)
+    total = energy.groupby("Datetime")["Input Active Power Total (W)"].sum()
+    ax2 = ax.twinx()
+    ax2.plot(total.index, total.values, color="black", linewidth=2.5,
+             linestyle="--", label="Total cluster")
+    ax2.set_ylabel("Total cluster power (W)")
+    ax.set_title(
+        "Real-time GPU power per node – 3 Dec 2025 (PDU readings every 5 min)",
+        fontsize=12
+    )
+    ax.set_ylabel("Power per node (W)")
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
+    ax.legend(loc="upper left", fontsize=8)
+    ax2.legend(loc="upper right", fontsize=9)
+    ax.grid(True, linestyle=":", alpha=0.5)
+    plt.tight_layout()
+    plt.savefig("plot_power_realtime.png", dpi=150, bbox_inches="tight")
+    plt.show()
+    print("  → plot_power_realtime.png")
+
+
+def plot_energy_by_model(agg):
+    """4-panel chart: total energy, total CO2, efficiency, CO2 per request."""
+    df = agg[agg["params_B"].notna()].copy()
+    fig, axes = plt.subplots(2, 2, figsize=(16, 11))
+    fig.suptitle(
+        f"DIANE – Energy consumption & CO₂ per model  "
+        f"(PUE={PUE}, {CO2_FACTOR} kg CO₂/kWh, central scenario)",
+        fontsize=13, fontweight="bold"
+    )
+    panels = [
+        (axes[0,0], "energy_fac_kWh", "kWh (facility, PUE 1.7)",
+         "Total energy consumed",          "{:,.0f}"),
+        (axes[0,1], "co2_kg",          "kg CO₂e",
+         "Total carbon footprint",         "{:,.1f}"),
+        (axes[1,0], "kWh_per_1M_tok",  "kWh / million tokens",
+         "Energy efficiency (↓ = better)", "{:,.2f}"),
+        (axes[1,1], "gCO2_per_req",    "g CO₂e per request",
+         "CO₂ per request",               "{:,.3f}"),
+    ]
+    for ax, col, xlabel, title, fmt in panels:
+        sub    = df.dropna(subset=[col])
+        names  = sub["Model"].apply(short)
+        colors = plt.cm.RdYlGn_r(np.linspace(0.15, 0.85, len(sub)))
+        bars   = ax.barh(names, sub[col], color=colors)
+        ax.set_xlabel(xlabel)
+        ax.set_title(title)
+        ax.bar_label(bars, labels=[fmt.format(v) for v in sub[col]],
+                     padding=3, fontsize=8)
+        ax.grid(axis="x", linestyle=":", alpha=0.5)
+    plt.tight_layout()
+    plt.savefig("plot_energy_by_model.png", dpi=150, bbox_inches="tight")
+    plt.show()
+    print("  → plot_energy_by_model.png")
+
+
+def plot_pie(agg, energy_it_central_kwh):
+    """Pie charts: share per model + IT vs datacenter overhead."""
+    df = agg[agg["params_B"].notna()].copy()
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
+    fig.suptitle("Energy distribution across the cluster", fontsize=13, fontweight="bold")
+
+    labels = df["Model"].apply(short)
+    ax1.pie(df["energy_fac_kWh"], labels=labels, autopct="%1.1f%%",
+            startangle=90, colors=plt.cm.tab10.colors[:len(df)])
+    ax1.set_title("Facility energy share per model")
+
+    overhead = energy_it_central_kwh * (PUE - 1)
+    ax2.pie(
+        [energy_it_central_kwh, overhead],
+        labels=[
+            f"IT servers\n{energy_it_central_kwh:,.0f} kWh",
+            f"Datacenter overhead\n(cooling, UPS, etc.)\n{overhead:,.0f} kWh",
+        ],
+        autopct="%1.1f%%", startangle=90, colors=["#4C72B0", "#DD8452"]
+    )
+    ax2.set_title(f"IT vs Overhead (PUE = {PUE})")
+    plt.tight_layout()
+    plt.savefig("plot_energy_split.png", dpi=150, bbox_inches="tight")
+    plt.show()
+    print("  → plot_energy_split.png")
+
+# ==============================================================================
+# 7. Summary
+# ==============================================================================
+
+def print_summary(agg, uptime):
+    """Print a summary table with all three uptime scenarios."""
+    u          = uptime
+    tot_req    = agg["total_requests"].sum()
+    tot_tok    = agg["total_tokens"].sum()
+    tot_spend  = agg["total_spend"].sum()
+    n_known    = agg["params_B"].notna().sum()
+    n_missing  = agg["params_B"].isna().sum()
+
+    print("=" * 65)
+    print("SUMMARY – DIANE Energy Analysis")
+    print("=" * 65)
+    print(f"Models with known parameters  : {n_known} / {len(agg)}")
+    print(f"Total requests                : {tot_req:,.0f}")
+    print(f"Total tokens                  : {tot_tok/1e9:.2f} billion")
+    print(f"Total spend                   : ${tot_spend:,.2f}")
+    print()
+    h = f"{'':32s} {'Optimistic':>12} {'Central':>12} {'Pessimistic':>13}"
+    s = f"{'':32s} {'(off w/o traffic)':>12} {'(average)':>12} {'(24/7)':>13}"
+    print(h)
+    print(s)
+    print("-" * 72)
+
+    rows = [
+        ("Uptime (days)",
+         u["n_days_optimistic"], (u["n_days_optimistic"]+u["n_days_pessimistic"])//2,
+         u["n_days_pessimistic"], "{:>12.0f}"),
+        ("IT energy (kWh)",
+         u["energy_it_optimistic"], u["energy_it_central"], u["energy_it_pessimistic"],
+         "{:>12,.0f}"),
+        ("Facility energy (kWh)",
+         u["energy_fac_optimistic"], u["energy_fac_central"], u["energy_fac_pessimistic"],
+         "{:>12,.0f}"),
+        ("CO₂ (kg)",
+         agg["co2_kg_optimistic"].sum(), agg["co2_kg"].sum(),
+         agg["co2_kg_pessimistic"].sum(), "{:>12,.1f}"),
+        ("Equiv. car distance (km)",
+         agg["co2_kg_optimistic"].sum()/120, agg["co2_kg"].sum()/120,
+         agg["co2_kg_pessimistic"].sum()/120, "{:>12,.0f}"),
+    ]
+    for label, opt, cen, pes, fmt in rows:
+        print(f"  {label:<30s} {fmt.format(opt)} {fmt.format(cen)} {fmt.format(pes)}")
+
+    print("-" * 72)
+    e = u["energy_fac_central"]
+    print(f"\nEfficiency metrics (central scenario):")
+    print(f"  Per request (avg)     : {e*1000/tot_req:.4f} Wh")
+    print(f"  Per million tokens    : {e/(tot_tok/1e6):.2f} kWh")
+    print(f"  Per dollar spent      : {e/tot_spend:.1f} kWh/$")
+    print("=" * 65)
+    print()
+    print("KNOWN LIMITATIONS:")
+    print(f"  - PDU measurement covers only 80 min (3 Dec 2025) – assumed representative")
+    print(f"  - Real uptime unknown: range is {u['n_days_optimistic']}–{u['n_days_pessimistic']} days")
+    print(f"  - PUE = {PUE} is an estimate; actual datacenter value unknown")
+    print(f"  - Energy attribution uses tokens × params proxy, not direct measurement")
+    if n_missing > 0:
+        missing = agg[agg["params_B"].isna()]["Model"].tolist()
+        print(f"  - {n_missing} model(s) excluded (missing parameter data): {missing}")
+
+# ==============================================================================
+# MAIN
+# ==============================================================================
+
+def main(use_hf=True, export=True):
+    sep = "=" * 55
+    print(sep)
+    print("DIANE Energy Analysis (Onyxia / S3)")
+    print(sep)
+
+    print("\n[0/6] Connecting to S3...")
+    fs = get_fs()
+    print(f"  Bucket   : s3://{S3_BUCKET}")
+    print(f"  Endpoint : {os.environ.get('S3_ENDPOINT', '?')}")
+
+    print("\n[1/6] Loading data from S3...")
+    usage  = load_usage(fs, S3_BUCKET, USAGE_FILES)
+    energy = load_energy(fs, S3_BUCKET, ENERGY_FILE)
+    print(f"  Usage  : {len(usage):,} rows | {usage['Model'].nunique()} models | "
+          f"{usage['Date'].min().date()} → {usage['Date'].max().date()}")
+    print(f"  Energy : {len(energy):,} rows | {energy['GPU'].nunique()} GPU nodes")
+
+    print(f"\n[2/6] Looking up model parameters "
+          f"{'(HuggingFace + fallback)' if use_hf else '(fallback only)'}...")
+    models = sorted(usage["Model"].unique())
+    params_map, excluded = build_params_map(models, use_hf)
+    print(f"  Models with data : {len(params_map)} | Excluded : {len(excluded)}")
+
+    print("\n[3/6] Computing energy estimates...")
+    agg, power_per_gpu, cluster_power_w, uptime = compute(
+        usage, energy, params_map, excluded
+    )
+    u = uptime
+    print(f"  Cluster power      : {cluster_power_w:.0f} W ({cluster_power_w/1000:.2f} kW IT)")
+    print(f"  Facility power     : {cluster_power_w*PUE:.0f} W (PUE {PUE})")
+    print(f"  Optimistic scenario: {u['n_days_optimistic']} days → "
+          f"{u['energy_fac_optimistic']:,.0f} kWh facility")
+    print(f"  Pessimistic scenario: {u['n_days_pessimistic']} days → "
+          f"{u['energy_fac_pessimistic']:,.0f} kWh facility")
+
+    print("\n[4/6] Summary...")
+    print_summary(agg, uptime)
+
+    print("\n[5/6] Generating charts...")
+    plot_power_realtime(energy)
+    plot_energy_by_model(agg)
+    plot_pie(agg, u["energy_it_central"])
+
+    if export:
+        print("\n[6/6] Exporting results to S3...")
+        out_path = f"{S3_BUCKET}/{OUTPUT_CSV}"
+        with fs.open(out_path, "w") as f:
+            agg.to_csv(f, index=False)
+        print(f"  → s3://{out_path}")
+        scenarios_df = pd.DataFrame([uptime])
+        with fs.open(f"{S3_BUCKET}/energy_uptime_scenarios.csv", "w") as f:
+            scenarios_df.to_csv(f, index=False)
+        print(f"  → s3://{S3_BUCKET}/energy_uptime_scenarios.csv")
+    else:
+        print("\n[6/6] Export skipped (--no-export)")
+
+    print("\nDone.")
+    return agg
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="DIANE Energy Analysis – Per-Model Energy & CO₂ Estimation"
+    )
+    parser.add_argument("--no-hf",     action="store_true",
+                        help="Skip HuggingFace lookup, use known values only")
+    parser.add_argument("--no-export", action="store_true",
+                        help="Do not write results to S3")
+    args, _ = parser.parse_known_args()
+    main(use_hf=not args.no_hf, export=not args.no_export)
