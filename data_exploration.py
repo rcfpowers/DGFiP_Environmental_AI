@@ -2,9 +2,7 @@ import subprocess
 import sys
 import os
 import s3fs
-import glob
 import pandas as pd
-from datetime import datetime
 import matplotlib.pyplot as plt
 import re
 
@@ -13,7 +11,6 @@ def install():
     pkgs = ["pandas", "numpy", "matplotlib", "huggingface_hub", "boto3", "s3fs"]
     print("Installing dependencies...")
     subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet"] + pkgs)
-    print("OK\n")
 
 
 install()
@@ -21,20 +18,28 @@ install()
 from huggingface_hub import HfApi
 
 S3_BUCKET = "projet-datalab-depp-dgfip"
-USAGE_FILES = ["diane_usage_daily_with_models_2026-01-28 (1).csv"]
-ENERGY_FILE = "releves_AI_FEB_2026.csv"
+USAGE_FILES = ["diane_usage_daily_with_models_fevrier.csv",
+               "diane_usage_daily_with_models_2026-01-28 (1).csv"]
 OUTPUT_CSV = None
 
-os.environ["AWS_ACCESS_KEY_ID"] = 'H8A6EFGJJN5KXVTOBMME'
-os.environ["AWS_SECRET_ACCESS_KEY"] = '1Rw2OFw8h+pcwTocZOzTsqIRyJ3xGYRfSuVdV59D'
-os.environ["AWS_SESSION_TOKEN"] = 'eyJhbGciOiJIUzUxMiIsInR5cCI6IkpXVCJ9.eyJhY2Nlc3NLZXkiOiJIOEE2RUZHSkpONUtYVlRPQk1NRSIsImFjciI6IjAiLCJhbGxvd2VkLW9yaWdpbnMiOlsiKiJdLCJhdWQiOlsibWluaW8iLCJhY2NvdW50Il0sImF1dGhfdGltZSI6MTc3Mjc2ODg2NSwiYXpwIjoib255eGlhLW1pbmlvIiwiZW1haWwiOiJyb2JlcnQucG93ZXJzQGVuc2FlLmZyIiwiZW1haWxfdmVyaWZpZWQiOnRydWUsImV4cCI6MTc3Mzk3ODgzNywiZmFtaWx5X25hbWUiOiJQT1dFUlMiLCJnaXZlbl9uYW1lIjoiUm9iZXJ0IiwiZ3JvdXBzIjpbImRhdGFsYWItZGVwcC1kZ2ZpcCJdLCJpYXQiOjE3NzI3NjkyMzUsImlzcyI6Imh0dHBzOi8vYXV0aC5ncm91cGUtZ2VuZXMuZnIvcmVhbG1zL2dlbmVzIiwianRpIjoiOGRjZjI5OTItNjMxYy00ZDBkLWJiMjktZjRjNGNjNmFkZWM3IiwibmFtZSI6IlJvYmVydCBQT1dFUlMiLCJwb2xpY3kiOiJzdHNvbmx5IiwicHJlZmVycmVkX3VzZXJuYW1lIjoicnBvd2Vycy1lbnNhZSIsInJlYWxtX2FjY2VzcyI6eyJyb2xlcyI6WyJvZmZsaW5lX2FjY2VzcyIsImRlZmF1bHQtcm9sZXMtZ2VuZXMiLCJ1bWFfYXV0aG9yaXphdGlvbiJdfSwicmVzb3VyY2VfYWNjZXNzIjp7ImFjY291bnQiOnsicm9sZXMiOlsibWFuYWdlLWFjY291bnQiLCJtYW5hZ2UtYWNjb3VudC1saW5rcyIsInZpZXctcHJvZmlsZSJdfX0sInNjb3BlIjoib3BlbmlkIHByb2ZpbGUgZW1haWwiLCJzaWQiOiJmMWVmM2I5Ni03NmQ5LTRiNTEtYjE0NS05NDc3Nzk5NDMwYWIiLCJzdWIiOiI2NzYzNDFlZC1mM2FlLTQzZDgtOTMzMS0zMTZjMzA4NDRlNjgiLCJ0eXAiOiJCZWFyZXIifQ.TH1NNSBA3H8Rgw93TZqSJ-uf8_F4ZGmoO1yZHKnbC9Q8WIK6fmPbLNNr_urgHP_FNqVMRgAxpSpm75fkXW6Ujg'
+"""
+Comment out when publishing and add descriptions of how to establish connection to underlying data
+"""
+
+os.environ["AWS_ACCESS_KEY_ID"] = '6JUTTZCSVX8TUV6TX10N'
+os.environ["AWS_SECRET_ACCESS_KEY"] = '4Y0LaYdkGgOXtfqP6FlcrCt3xBr+hs4YtJhKEYvy'
+os.environ["AWS_SESSION_TOKEN"] = 'eyJhbGciOiJIUzUxMiIsInR5cCI6IkpXVCJ9.eyJhY2Nlc3NLZXkiOiI2SlVUVFpDU1ZYOFRVVjZUWDEwTiIsImFjciI6IjAiLCJhbGxvd2VkLW9yaWdpbnMiOlsiKiJdLCJhdWQiOlsibWluaW8iLCJhY2NvdW50Il0sImF1dGhfdGltZSI6MTc3MzQ4NjQ4MSwiYXpwIjoib255eGlhLW1pbmlvIiwiZW1haWwiOiJyb2JlcnQucG93ZXJzQGVuc2FlLmZyIiwiZW1haWxfdmVyaWZpZWQiOnRydWUsImV4cCI6MTc3NDY5NzM0MywiZmFtaWx5X25hbWUiOiJQT1dFUlMiLCJnaXZlbl9uYW1lIjoiUm9iZXJ0IiwiZ3JvdXBzIjpbImRhdGFsYWItZGVwcC1kZ2ZpcCJdLCJpYXQiOjE3NzM0ODc3NDEsImlzcyI6Imh0dHBzOi8vYXV0aC5ncm91cGUtZ2VuZXMuZnIvcmVhbG1zL2dlbmVzIiwianRpIjoiMWY3NDA4OWQtZDg4Yi00NzMxLThhNTUtNzQzZWEyYzQ5Zjg4IiwibmFtZSI6IlJvYmVydCBQT1dFUlMiLCJwb2xpY3kiOiJzdHNvbmx5IiwicHJlZmVycmVkX3VzZXJuYW1lIjoicnBvd2Vycy1lbnNhZSIsInJlYWxtX2FjY2VzcyI6eyJyb2xlcyI6WyJvZmZsaW5lX2FjY2VzcyIsImRlZmF1bHQtcm9sZXMtZ2VuZXMiLCJ1bWFfYXV0aG9yaXphdGlvbiJdfSwicmVzb3VyY2VfYWNjZXNzIjp7ImFjY291bnQiOnsicm9sZXMiOlsibWFuYWdlLWFjY291bnQiLCJtYW5hZ2UtYWNjb3VudC1saW5rcyIsInZpZXctcHJvZmlsZSJdfX0sInNjb3BlIjoib3BlbmlkIHByb2ZpbGUgZW1haWwiLCJzaWQiOiJmNmU1ZGRmMi1kYjE3LTRjZDEtOWE2NS0wOGQyZjc4ZjM3N2QiLCJzdWIiOiI2NzYzNDFlZC1mM2FlLTQzZDgtOTMzMS0zMTZjMzA4NDRlNjgiLCJ0eXAiOiJCZWFyZXIifQ.PjLM_zxZSLNu4kbEZ9VeV4R8WJsO3EOn2W3hn6y0Ylja8b_-qph7pD-I4jvJ4csac51GyGAEeuvbffPAdyVHLQ'
 os.environ["AWS_DEFAULT_REGION"] = 'us-east-1'
+
 fs = s3fs.S3FileSystem(
     client_kwargs={'endpoint_url': 'https://'+'minio-simple.lab.groupe-genes.fr'},
-    key=os.environ["AWS_ACCESS_KEY_ID"],
-    secret=os.environ["AWS_SECRET_ACCESS_KEY"],
-    token=os.environ["AWS_SESSION_TOKEN"])
+    key = os.environ["AWS_ACCESS_KEY_ID"],
+    secret = os.environ["AWS_SECRET_ACCESS_KEY"],
+    token = os.environ["AWS_SESSION_TOKEN"])
 
+"""
+Is it possible to make MODEL_HF_REPO and MODEL_PARAMS_B_KNOWN dynamic?
+"""
 
 MODEL_HF_REPO = {
     "gte-Qwen2-1-5B-instruct": "Alibaba-NLP/gte-Qwen2-1.5B-instruct",
@@ -42,7 +47,7 @@ MODEL_HF_REPO = {
     "Llama-3-3-70B-128k": "meta-llama/Llama-3.3-70B-Instruct",
     "Mistral-Small-24B-Instruct-2501-FP8-dynamic": "mistralai/Mistral-Small-24B-Instruct-2501",
     "/model/deepdml-faster-whisper-large-v3-turbo-ct2": "deepdml/faster-whisper-large-v3-turbo-ct2",
-    "qwen3vl32binstruct": "Qwen/Qwen2.5-VL-32B-Instruct",
+    "qwen3vl32binstruct": "Qwen/Qwen3-VL-32B-Instruct",
     "gptoss20b": "openai/gpt-oss-20b",
     "gptoss120b": "openai/gpt-oss-120b",
     "dgfip-e5-large": "intfloat/e5-large",
@@ -50,19 +55,21 @@ MODEL_HF_REPO = {
 
 MODEL_PARAMS_B_KNOWN = {
     # Retrieved from HuggingFace safetensors
-    "gte-Qwen2-1-5B-instruct":                          1.776,
-    "Qwen2.5-Coder-32B-Instruct-fp8-W8A16":            32.764,
-    "Llama-3-3-70B-128k":                               70.0,
-    "Mistral-Small-24B-Instruct-2501-FP8-dynamic":      24.0,
-    "/model/deepdml-faster-whisper-large-v3-turbo-ct2":  0.809,
-    # Internal models – inferred from model name
-    "gptoss20b":                                         20.0,
-    "gptoss120b":                                       120.0,
-    # Fine-tune of microsoft/e5-large
-    "dgfip-e5-large":                                    0.335,
+    "gte-Qwen2-1-5B-instruct": 1.776,
+    "Qwen2.5-Coder-32B-Instruct-fp8-W8A16": 32.764,
+    "Llama-3-3-70B-128k": 70.0,
+    "Mistral-Small-24B-Instruct-2501-FP8-dynamic": 24.0,
+    "/model/deepdml-faster-whisper-large-v3-turbo-ct2": 0.809,
+    "dgfip-e5-large": 0.335,
+    # Desk Research
+    "gptoss20b": 20.0,
+    "gptoss120b": 120.0,
+    "qwen3vl32binstruct":   32.8,
 }
 
-
+"""
+Make function comments
+"""
 def load_usage(fs, bucket, files):
     dfs = []
     for f in files:
@@ -77,25 +84,36 @@ def load_usage(fs, bucket, files):
     usage["Spend ($)"] = pd.to_numeric(usage["Spend ($)"], errors="coerce").fillna(0)
     return usage
 
+"""
+Make function comments
+"""
+def load_energy(fs, bucket):
+    pattern = re.compile(r"^\d{3}_[A-Za-z]\d+_Voie\d+_\d{8}\.csv$")
+    all_files = fs.ls(bucket)
+    energy_files = [f for f in all_files if pattern.match(os.path.basename(f))]
 
-def load_energy(fs, bucket, energy_file):
-    print(f"  Reading: s3://{bucket}/{energy_file}")
-    
-    with fs.open(f"{bucket}/{energy_file}") as fh:
-        df = pd.read_csv(fh)
-    print(df.columns)
+    print(f"  Found {len(energy_files)} energy files matching naming convention")
+
+    dfs = []
+    for f in energy_files:
+        with fs.open(f) as fh:
+            df = pd.read_csv(fh, skiprows=1)
+        df["timestamp"] = pd.to_datetime(df["Time (UTC)"])
+        df["source_file"] = os.path.basename(f)
+        dfs.append(df)
+
+    df = pd.concat(dfs, ignore_index=True)
+
+    cols_to_check = [c for c in df.columns if c != "source_file"]
+    df = df.drop_duplicates(subset=cols_to_check)
+
     df = df.sort_values(["source_file", "timestamp"])
-    #df['energy_used'] = df['Input Cumulated Energy Total (Wh)'].diff()
     df["Datetime"] = pd.to_datetime(df["timestamp"], utc=True)
     df = df.dropna()
-    df["ID_Voie"] = df["source_file"].str.replace(".csv","", regex=False).str.rsplit("_", n=1).str[0]
-    df = df.sort_values(["ID_Voie", "Datetime"])
-    df['energy_used'] = df.groupby('ID_Voie')['Input Cumulated Energy Total (Wh)'].diff()
-    #df = df[["Datetime", "energy_used", "ID", "Voie"]]
+    df["ID_Voie"] = df["source_file"].str.replace(".csv", "", regex=False).str.rsplit("_", n=1).str[0]
+    df = df.sort_values(["ID_Voie", "Datetime"]).reset_index(drop=True)
 
-    print(df[["Datetime","ID_Voie","Input Cumulated Energy Total (Wh)","energy_used"]].head(10))
-
-    #df = df.sort_values("Datetime")
+    df['energy_used'] = df.groupby('ID_Voie')['Input Cumulated Energy Total (Wh)'].diff(periods=2)
 
     for id_val, group in df.groupby("ID_Voie"):
         plt.plot(group["Datetime"], group["energy_used"], label=id_val)
@@ -106,7 +124,6 @@ def load_energy(fs, bucket, energy_file):
     plt.legend(title="ID")
     plt.xticks(rotation=45)
     plt.tight_layout()
-
     plt.show()
 
     df.to_csv("/home/onyxia/work/energy.csv", index=False)
@@ -154,11 +171,59 @@ def build_params_map(models, use_hf):
     return params_map, excluded
 
 
-print("\n[1/6] Loading data from S3...")
-df_usage = load_usage(fs, S3_BUCKET, USAGE_FILES)
-df_energy = load_energy(fs, S3_BUCKET, ENERGY_FILE)
+def estimate_wh_per_1000_tokens(energy_df, usage_df):
+    """
+    Estimate Wh per 1000 tokens for all models on all days.
+    Currently filtered to clean single-model days for gte-Qwen2-1-5B-instruct.
+    TODO: expand as data quality improves.
+    """
+    # --- Aggregate energy to daily level ---
+    # Strip timezone before normalising to avoid merge type mismatch
+    energy_df["date"] = energy_df["Datetime"].dt.tz_localize(None).dt.normalize()
+    energy_df = energy_df[energy_df["ID_Voie"].isin(["101_J37_Voie1"])]
+    energy_daily = (
+        energy_df
+        .groupby("date")
+        .agg(total_energy_wh=("energy_used", "sum"))
+        .reset_index()
+    )
 
-print(df_energy.head())
+    # --- Normalise date column in usage data ---
+    usage_df["date"] = pd.to_datetime(usage_df["Date"]).dt.normalize()
+
+    # --- Join on date ---
+    merged = usage_df.merge(energy_daily, on="date", how="left")
+
+    # --- Compute Wh per 1000 tokens for all rows ---
+    merged["wh_per_1000_tokens"] = (merged["total_energy_wh"] / merged["Total Tokens"]) * 1000
+
+    # --- Filter to clean estimation window: single-model days for gte-Qwen2-1-5B-instruct ---
+    # TODO: remove this filter as more clean single-model days are identified
+    clean_dates = pd.to_datetime(["2026-02-01", "2026-02-02"])
+    clean_model = "gte-Qwen2-1-5B-instruct"
+    clean = merged[
+        (merged["date"].isin(clean_dates)) &
+        (merged["Model"] == clean_model)
+    ]
+
+    # --- Summary estimate ---
+    total_tokens = clean["Total Tokens"].sum()
+    total_energy = clean["total_energy_wh"].sum()
+    overall_estimate = (total_energy / total_tokens) * 1000
+
+    print(clean[["date", "Model", "Total Tokens", "total_energy_wh", "wh_per_1000_tokens"]])
+    print(f"\n  Model: {clean_model}")
+    print(f"  Total Tokens: {total_tokens:,}")
+    print(f"  Total Energy: {total_energy:,.1f} Wh")
+    print(f"  Estimate: {overall_estimate:.4f} Wh / 1000 tokens")
+
+    return merged, overall_estimate
+
+
+df_usage = load_usage(fs, S3_BUCKET, USAGE_FILES)
+df_energy = load_energy(fs, S3_BUCKET)
+
+result_df, wh_per_1000 = estimate_wh_per_1000_tokens(df_energy, df_usage)
 
 use_hf = True
 
@@ -257,6 +322,6 @@ print(f"\n[2/6] Looking up model parameters "
       f"{'(HuggingFace + fallback)' if use_hf else '(fallback only)'}...")
 models = sorted(df_usage["Model"].unique())
 
-print(df_usage.columns)
+print(models)
 
 print(df_usage.head())
