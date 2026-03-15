@@ -1,540 +1,1871 @@
-#Estimates how much energy and CO₂ each LLM model consumed on the DIANE platform between October and December 2025. 
-It pulls usage data (tokens, requests) and GPU power measurements from our shared S3 bucket, 
-looks up model sizes on HuggingFace, and splits total cluster energy across models proportionally to their computational load. 
-Results include energy per model (kWh), carbon footprint (kg CO₂), and efficiency metrics (Wh per request, kWh per million tokens). 
-Run it directly on Onyxia — credentials and S3 endpoint are picked up automatically from the environment.#
-"""
-DIANE Energy Analysis – Per-Model Energy & CO₂ Estimation
-==========================================================
-This script estimates how much energy and CO₂ each LLM model consumed
-on the DIANE platform. It pulls usage data (tokens, requests) and GPU
-power measurements from our shared S3 bucket, looks up model sizes on
-HuggingFace, and splits total cluster energy across models proportionally
-to their computational load.
+Diane_energy_analysis.py
 
-Results include:
-  - Energy per model (kWh), carbon footprint (kg CO₂)
-  - Efficiency metrics: Wh per request, kWh per million tokens
-  - Two uptime scenarios (optimistic vs pessimistic) to reflect
-    uncertainty about when the cluster is actually running
+Estimates electricity consumption and CO2 emissions per LLM model on the
+DIANE platform (DGFiP / ENSAE), using PDU power measurements and LiteLLM
+usage logs stored on Onyxia / SSPCloud (S3/MinIO).
 
-Run directly on Onyxia — S3 credentials are picked up automatically
-from the environment (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY,
-AWS_SESSION_TOKEN, S3_ENDPOINT).
+Energy measurement
+------------------
+  Dec 2025 : 80-min PDU snapshot -> average cluster power * uptime (3 scenarios)
+  Feb 2026 : full-month cumulative PDU counter -> sum of diffs per circuit
 
-Usage:
+Attribution corrections
+-----------------------
+  FIX 1  Quantisation   : q_i per dtype (FP8=0.50, MXFP4-MoE=0.339)
+  FIX 2  MoE sparsity   : eff_params = non_MoE + (top_k/n_experts)*MoE_params
+  FIX 3  Idle GPU power : 7% of cluster energy allocated by hosting days
+
+HuggingFace model parameters
+-----------------------------
+  Priority: safetensors metadata -> config.json -> hardcoded fallback.
+  MoE architecture and dtype also auto-detected from config.json.
+
+Usage
+-----
   python diane_energy_analysis.py
-  python diane_energy_analysis.py --no-hf       # skip HuggingFace lookup
-  python diane_energy_analysis.py --no-export   # do not write results to S3
+  python diane_energy_analysis.py --no-hf
+  python diane_energy_analysis.py --no-export
+  python diane_energy_analysis.py --hf-token hf_xxxxx
 """
 
-# ==============================================================================
-# 0. Install dependencies
-# ==============================================================================
+# 0. Dependencies
 import subprocess, sys
 
-def install():
-    pkgs = ["pandas", "numpy", "matplotlib", "huggingface_hub", "boto3", "s3fs"]
-    print("Installing dependencies...")
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet"] + pkgs)
-    print("OK\n")
+def _install():
+    pkgs = ["pandas", "numpy", "matplotlib", "huggingface_hub", "s3fs"]
+    try:
+        subprocess.check_call(
+            [sys.executable, "-m", "pip", "install", "--quiet",
+             "--break-system-packages"] + pkgs,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,)
+    except Exception:
+        pass
 
-install()
+_install()
 
-import argparse
-import os
+import argparse, io, json, os, re, zipfile
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 import s3fs
 
-# ==============================================================================
-# 1. Configuration
-# ==============================================================================
+try:
+    from huggingface_hub import HfApi, hf_hub_download, utils as hf_utils
+    HF_AVAILABLE = True
+except ImportError:
+    HF_AVAILABLE = False
 
-S3_BUCKET   = "projet-datalab-depp-dgfip"
-USAGE_FILES = ["diane_usage_daily_with_models_2026-01-28 (1).csv"]
-ENERGY_FILE = "Energy_Data_Clean.csv"
-OUTPUT_CSV  = "energy_per_model_results.csv"
+# 1. Configuration  -- edit these values to adapt to a new deployment
 
-PUE        = 1.7    # Power Usage Effectiveness of the datacenter
-CO2_FACTOR = 0.052  # kg CO2e / kWh (France, RTE 2024)
+# S3 bucket and subfolder
+# The script auto-detects which Onyxia instance it is running on:
+#   - SSPCloud  (minio.lab.sspcloud.fr)    -> bucket: leti
+#   - Groupe Genes (minio-simple.lab.groupe-genes.fr) -> bucket: projet-datalab-depp-dgfip
+# You can override by setting S3_BUCKET manually below.
+import os as _os_cfg
+_endpoint = (_os_cfg.environ.get("S3_ENDPOINT") or
+             _os_cfg.environ.get("AWS_S3_ENDPOINT") or "")
+if "sspcloud" in _endpoint:
+    S3_BUCKET    = "leti"
+    S3_SUBFOLDER = "Policy in action "   # trailing space -- exact MinIO folder name
+elif "groupe-genes" in _endpoint:
+    S3_BUCKET    = "projet-datalab-depp-dgfip"
+    S3_SUBFOLDER = ""                    # files are at bucket root
+else:
+    # Fallback: set manually
+    S3_BUCKET    = "leti"
+    S3_SUBFOLDER = "Policy in action "
+del _os_cfg, _endpoint
 
-# Model parameter counts (billions).
-# Priority: HuggingFace safetensors > values below > excluded from results.
+# Input files
+USAGE_FILES     = [
+    "diane_usage_daily_with_models_fevrier.csv",]
+# Oct-Dec file kept as reference but not loaded by default
+# "diane_usage_daily_with_models_2026-01-28 (1).csv"
+ENERGY_FILE_DEC = "Energy_Data_Clean.csv"       # Dec 2025 PDU snapshot
+ENERGY_FILE_FEB = "releves_AI_FEB_2026.csv"     # Feb 2026 cumulative counter
+
+# Zip archive (contains all input files; used as primary source)
+ZIP_FILENAME          = "onyxia-download-2026-03-14T10_28_53.795Z.zip"
+UPLOAD_AFTER_EXTRACT  = True   # re-upload extracted CSVs to bucket root for convenience
+
+# Output files (written to bucket root)
+OUTPUT_CSV     = "energy_per_model_results.csv"
+OUTPUT_SUMMARY = "energy_summary.csv"
+
+# Physical constants
+PUE             = 1.7      # Power Usage Effectiveness (estimate; confirm with facilities team)
+CO2_FACTOR      = 0.052    # kg CO2e / kWh  (France, RTE eco2mix 2024 annual average)
+IDLE_POWER_FRACTION = 0.00 # FIX 3 disabled: attribution by compute weight only
+
+# Known model parameter counts [B] -- fallback when HuggingFace is unavailable
 MODEL_PARAMS_B_KNOWN = {
-    # Retrieved from HuggingFace safetensors
-    "gte-Qwen2-1-5B-instruct":                          1.776,
-    "Qwen2.5-Coder-32B-Instruct-fp8-W8A16":            32.764,
-    # From official vendor documentation
-    "Llama-3-3-70B-128k":                               70.0,
-    "Mistral-Small-24B-Instruct-2501-FP8-dynamic":      24.0,
-    "/model/deepdml-faster-whisper-large-v3-turbo-ct2":  0.809,
-    # Internal models – inferred from model name
-    "gptoss20b":                                         20.0,
-    "gptoss120b":                                       120.0,
-    # Fine-tune of microsoft/e5-large
-    "dgfip-e5-large":                                    0.335,
-}
+    "gte-Qwen2-1-5B-instruct":                           1.776,
+    "Qwen2.5-Coder-32B-Instruct-fp8-W8A16":             32.764,
+    "Llama-3-3-70B-128k":                                70.0,
+    "Mistral-Small-24B-Instruct-2501-FP8-dynamic":       24.0,
+    "/model/deepdml-faster-whisper-large-v3-turbo-ct2":   0.809,
+    "gptoss20b":                                          21.512,
+    "gptoss120b":                                        120.412,
+    "dgfip-e5-large":                                     0.335,
+    "qwen3vl32binstruct":                                32.0,}
 
-# Mapping from model name (as it appears in the CSV) to HuggingFace repo.
-# None = internal model, not available on HuggingFace.
+# HuggingFace repository IDs (None = internal/private, use fallback only)
 MODEL_HF_REPO = {
-    "gte-Qwen2-1-5B-instruct":                         "Alibaba-NLP/gte-Qwen2-1.5B-instruct",
-    "Qwen2.5-Coder-32B-Instruct-fp8-W8A16":            "Qwen/Qwen2.5-Coder-32B-Instruct",
-    "Llama-3-3-70B-128k":                              "meta-llama/Llama-3.3-70B-Instruct",
-    "Mistral-Small-24B-Instruct-2501-FP8-dynamic":     "mistralai/Mistral-Small-24B-Instruct-2501",
-    "/model/deepdml-faster-whisper-large-v3-turbo-ct2": "deepdml/faster-whisper-large-v3-turbo-ct2",
-    "qwen3vl32binstruct":                               "Qwen/Qwen2.5-VL-32B-Instruct",
-    "gptoss20b":        None,
-    "gptoss120b":       None,
-    "dgfip-e5-large":   None,
-}
+    "gte-Qwen2-1-5B-instruct":                          "Alibaba-NLP/gte-Qwen2-1.5B-instruct",
+    "Qwen2.5-Coder-32B-Instruct-fp8-W8A16":             "Qwen/Qwen2.5-Coder-32B-Instruct",
+    "Llama-3-3-70B-128k":                               "meta-llama/Llama-3.3-70B-Instruct",
+    "Mistral-Small-24B-Instruct-2501-FP8-dynamic":      "mistralai/Mistral-Small-24B-Instruct-2501",
+    "/model/deepdml-faster-whisper-large-v3-turbo-ct2":  "deepdml/faster-whisper-large-v3-turbo-ct2",
+    "qwen3vl32binstruct":                                "Qwen/Qwen2.5-VL-32B-Instruct",
+    "gptoss20b":      "openai/gpt-oss-20b",
+    "gptoss120b":     "openai/gpt-oss-120b",
+    "dgfip-e5-large": None,}
 
-# ==============================================================================
-# 2. S3 connection
-# ==============================================================================
+# FIX 1: quantisation factors
+# FP8: ~50% FLOPs vs FP16.
+# MXFP4-MoE: 0.10*1.0 + 0.90*(4.25/16) = 0.339  (90% weights at 4.25 effective bits)
+QUANT_FACTOR = {
+    "fp32":            1.000,
+    "fp16":            1.000,
+    "bf16":            1.000,
+    "fp8":             0.500,
+    "int8":            0.500,
+    "int4":            0.250,
+    "mxfp4_moe_90pct": 0.339,}
+
+MODEL_DTYPE = {
+    "gte-Qwen2-1-5B-instruct":                          "fp16",
+    "Qwen2.5-Coder-32B-Instruct-fp8-W8A16":             "fp8",
+    "Llama-3-3-70B-128k":                               "bf16",
+    "Mistral-Small-24B-Instruct-2501-FP8-dynamic":      "fp8",
+    "/model/deepdml-faster-whisper-large-v3-turbo-ct2": "fp16",
+    "gptoss20b":                                        "mxfp4_moe_90pct",
+    "gptoss120b":                                       "mxfp4_moe_90pct",
+    "dgfip-e5-large":                                   "fp16",
+    "qwen3vl32binstruct":                               "bf16",}
+
+# FIX 2: MoE effective active parameters [B]
+# Formula: eff = (1 - f_MoE)*total + (top_k/n_experts)*f_MoE*total,  f_MoE = 0.90
+# gptoss120b: 128 experts top-4  ->  eff = 0.10*120.412 + (4/128)*0.90*120.412 = 15.43 B
+# gptoss20b:   32 experts top-4  ->  eff = 0.10*21.512  + (4/32 )*0.90*21.512  =  4.57 B
+MODEL_ACTIVE_PARAMS_B = {
+    "gptoss120b": 15.43,
+    "gptoss20b":   4.57,}
+
+# 2. S3 helpers
+
+# Resolved at runtime by list_data_files(); do not set manually.
+_S3_WORKING_PREFIX = None
 
 def get_fs():
-    """
-    Connect to S3 using credentials injected by Onyxia into the environment.
-    Variables: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN,
-               S3_ENDPOINT, AWS_DEFAULT_REGION.
-    """
+    """Return an authenticated s3fs filesystem from Onyxia environment variables."""
     endpoint = os.environ.get("S3_ENDPOINT") or os.environ.get("AWS_S3_ENDPOINT")
     if not endpoint:
         raise EnvironmentError(
-            "S3_ENDPOINT not found. Run this script from an Onyxia service "
-            "or set the environment variable manually."
-        )
+            "S3_ENDPOINT not set. Run this script inside an Onyxia service.")
     return s3fs.S3FileSystem(
         key=os.environ.get("AWS_ACCESS_KEY_ID"),
         secret=os.environ.get("AWS_SECRET_ACCESS_KEY"),
         token=os.environ.get("AWS_SESSION_TOKEN"),
-        endpoint_url=endpoint,
-        client_kwargs={"region_name": os.environ.get("AWS_DEFAULT_REGION", "us-east-1")},
-    )
+        client_kwargs={
+            "endpoint_url": endpoint,
+            "region_name": os.environ.get("AWS_DEFAULT_REGION", "us-east-1"),},)
 
-# ==============================================================================
-# 3. Model parameter lookup via HuggingFace
-# ==============================================================================
+def s3_path(*parts):
+    """Build a full S3 path under the working prefix resolved at runtime."""
+    if _S3_WORKING_PREFIX:
+        base = _S3_WORKING_PREFIX
+    elif S3_SUBFOLDER.strip():
+        base = f"{S3_BUCKET}/{S3_SUBFOLDER}"
+    else:
+        base = S3_BUCKET
+    for p in parts:
+        base = base.rstrip("/") + "/" + p.lstrip("/")
+    return base
 
-def fetch_hf_params(model_name, hf_repo):
+def list_data_files(fs):
     """
-    Query HuggingFace Hub for the exact number of parameters.
-    Returns value in billions, or None if not found.
-    Sources checked in order: safetensors metadata → config.
+    List all data files, handling two deployment modes:
+      - SSPCloud:     files are inside a subfolder (S3_SUBFOLDER != "")
+      - Groupe Genes: files are at the bucket root  (S3_SUBFOLDER == "")
+    Returns dict: {filename: full_s3_path}
     """
+    global _S3_WORKING_PREFIX
+
     try:
-        from huggingface_hub import HfApi
-        info = HfApi().model_info(hf_repo)
-        if info.safetensors and info.safetensors.total:
-            p = info.safetensors.total / 1e9
-            print(f"  [HF]   {model_name}: {p:.3f}B (safetensors)")
-            return p
-        config = getattr(info, "config", None) or {}
-        if "num_parameters" in config:
-            p = config["num_parameters"] / 1e9
-            print(f"  [HF]   {model_name}: {p:.3f}B (config)")
-            return p
-        print(f"  [--]   {model_name}: no parameter data on HF ({hf_repo})")
-        return None
+        root_items = fs.ls(S3_BUCKET, detail=False)
     except Exception as e:
-        print(f"  [ERR]  {model_name}: HF error → {e}")
+        print(f"  [ERR] Cannot list s3://{S3_BUCKET}: {e}")
+        return {}
+
+    bucket_prefix = S3_BUCKET.rstrip("/") + "/"
+    root_entries  = [
+        p[len(bucket_prefix):] if p.startswith(bucket_prefix) else p.split("/")[-1]
+        for p in root_items]
+    print(f"  Bucket root entries: {root_entries}")
+
+    # ── Case A: no subfolder (Groupe Genes, files at bucket root)
+    if not S3_SUBFOLDER.strip():
+        csv_files = [e for e in root_entries if e.endswith(".csv")]
+        print(f"  No subfolder configured -- using bucket root ({len(csv_files)} CSVs found)")
+        _S3_WORKING_PREFIX = S3_BUCKET.rstrip("/")
+        result = {e: f"{S3_BUCKET}/{e}" for e in root_entries if e}
+        for fname in sorted(f for f in result if f.endswith(".csv")):
+            print(f"    - {repr(fname)}")
+        return result
+
+    # ── Case B: files inside a subfolder (SSPCloud) 
+    # Match subfolder by stripped name (tolerates trailing space in MinIO)
+    subfolder_match = next(
+        (e for e in root_entries if e.strip().lower() == S3_SUBFOLDER.strip().lower()),
+        next((e for e in root_entries if e.strip().lower().startswith("policy")), None),)
+    if subfolder_match is None:
+        print(f"  [ERR] Subfolder matching '{S3_SUBFOLDER}' not found in bucket root.")
+        return {}
+
+    folder_path = f"{S3_BUCKET}/{subfolder_match}"
+    print(f"  Entering folder: s3://{folder_path}")
+
+    try:
+        items = fs.ls(folder_path, detail=False)
+    except Exception as e:
+        print(f"  [ERR] Cannot list s3://{folder_path}: {e}")
+        return {}
+
+    folder_prefix = folder_path.rstrip("/") + "/"
+    result = {p[len(folder_prefix):].strip(): p
+        for p in items
+        if p[len(folder_prefix):].strip()}
+
+    _S3_WORKING_PREFIX = folder_path.rstrip("/")
+    print(f"  Found {len(result)} files in s3://{folder_path}:")
+    for fname in sorted(result):
+        print(f"    - {repr(fname)}")
+    return result
+
+def _check_credentials():
+    """Print S3 credential status and raise clearly if missing or expired."""
+    key    = os.environ.get("AWS_ACCESS_KEY_ID",     "")
+    secret = os.environ.get("AWS_SECRET_ACCESS_KEY", "")
+    token  = os.environ.get("AWS_SESSION_TOKEN",     "")
+    ep     = os.environ.get("S3_ENDPOINT") or os.environ.get("AWS_S3_ENDPOINT", "")
+
+    print("  Credential check:")
+    print(f"    S3_ENDPOINT          : {ep or '[MISSING]'}")
+    print(f"    AWS_ACCESS_KEY_ID    : {key[:8] + '...' if key else '[MISSING]'}")
+    print(f"    AWS_SECRET_ACCESS_KEY: {'set' if secret else '[MISSING]'}")
+    print(f"    AWS_SESSION_TOKEN    : "
+          f"{'set (' + str(len(token)) + ' chars)' if token else '[MISSING]'}")
+
+    missing = [v for v, x in [("S3_ENDPOINT", ep),
+                               ("AWS_ACCESS_KEY_ID", key),
+                               ("AWS_SECRET_ACCESS_KEY", secret)] if not x]
+    if missing:
+        raise EnvironmentError(
+            f"Missing environment variables: {missing}\n"
+            "Restart the Onyxia service or run: source /vault/secrets/s3")
+
+    try:
+        fs_test = s3fs.S3FileSystem(
+            key=key, secret=secret, token=token or None,
+            client_kwargs={"endpoint_url": ep,
+                           "region_name": os.environ.get("AWS_DEFAULT_REGION", "us-east-1")},)
+        fs_test.ls(S3_BUCKET)
+        print("  S3 connectivity     : OK")
+    except Exception as e:
+        err = str(e)
+        if "InvalidAccessKeyId" in err or "does not exist" in err:
+            raise EnvironmentError(
+                f"S3 credentials INVALID or EXPIRED.\n"
+                f"Fix: restart the Onyxia Jupyter service.\nOriginal error: {e}")
+        elif "NoSuchBucket" in err:
+            raise EnvironmentError(
+                f"Bucket '{S3_BUCKET}' not found. Check S3_BUCKET in config.\n"
+                f"Original error: {e}")
+        else:
+            print(f"  [WARN] S3 connectivity test failed: {e} -- continuing anyway.")
+
+# 3. Data loading from zip / S3
+
+def download_and_extract_zip(fs, local_dir="./diane_data"):
+    """
+    Download ZIP_FILENAME from S3, extract all CSV files to local_dir,
+    optionally re-upload CSVs to the bucket root, and return
+    {filename: local_path} for all extracted CSVs.
+    """
+    os.makedirs(local_dir, exist_ok=True)
+    zip_s3_path = s3_path(ZIP_FILENAME)
+    print(f"  Downloading: s3://{zip_s3_path}")
+
+    try:
+        with fs.open(zip_s3_path, "rb") as fh:
+            zip_bytes = fh.read()
+        print(f"  Downloaded: {len(zip_bytes)/1e6:.1f} MB")
+    except Exception as e:
+        print(f"  [ERR] Cannot download zip: {e}  (path={zip_s3_path})")
+        return {}
+
+    extracted = {}
+    try:
+        with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+            members = zf.namelist()
+            print(f"  Zip contains {len(members)} files:")
+            for m in members:
+                print(f"    - {m}")
+            for member in members:
+                if not member.endswith(".csv"):
+                    continue
+                fname = os.path.basename(member)
+                if not fname:
+                    continue
+                local_path = os.path.join(local_dir, fname)
+                with zf.open(member) as src_f, open(local_path, "wb") as dst_f:
+                    dst_f.write(src_f.read())
+                extracted[fname] = local_path
+                print(f"  Extracted: {fname} -> {local_path}")
+    except zipfile.BadZipFile as e:
+        print(f"  [ERR] Bad zip: {e}")
+        return {}
+
+    if UPLOAD_AFTER_EXTRACT and extracted:
+        dest_bucket = S3_BUCKET
+        print(f"\n  Uploading {len(extracted)} CSVs to s3://{dest_bucket}/...")
+        for fname, local_path in extracted.items():
+            try:
+                fs.put(local_path, f"{dest_bucket}/{fname}")
+                print(f"    Uploaded: {fname}")
+            except Exception as e:
+                print(f"    [WARN] Could not upload {fname}: {e}")
+
+    return extracted
+
+def _check_token_granularity(usage):
+    """
+    Detect whether the LiteLLM export contains per-model token counts or
+    per-team totals replicated across all models (a known export format issue).
+    Prints a warning if replication is detected -- does not raise an error
+    because energy/CO2 totals remain valid regardless.
+    """
+    suspicious_days = 0
+    total_days = 0
+    for date, group in usage.groupby("Date"):
+        if len(group) < 2:
+            continue
+        total_days += 1
+        # If all models on the same day have the exact same token count,
+        # the file is almost certainly a team-level export replicated per model.
+        tok_vals = group["Total Tokens"].unique()
+        if len(tok_vals) == 1:
+            suspicious_days += 1
+
+    if total_days == 0:
+        return
+
+    ratio = suspicious_days / total_days
+    if ratio > 0.5:
+        print(
+            f"\n  [WARN] Token granularity: on {suspicious_days}/{total_days} days "
+            f"all models share identical token counts.")
+        print(
+            "         This LiteLLM export is per-TEAM, not per-MODEL.")
+        print(
+            "         Energy/CO2 totals are unaffected (from PDU).")
+        print(
+            "         Per-model attribution relies on params/architecture only.")
+        print(
+            "         kWh/Mtok values are not meaningful with this export format.")
+    else:
+        print(f"  [OK]  Token granularity: per-model data confirmed "
+              f"({total_days - suspicious_days}/{total_days} days have distinct values).")
+
+def load_csv_local(local_paths):
+    """
+    Load usage CSVs from a dict {filename: local_path}.
+    Skips PDU/energy/output files; keeps only LiteLLM usage exports.
+    Returns a combined DataFrame or None if nothing loaded.
+    """
+    USAGE_KW   = ("usage", "diane", "model", "litellm", "fevrier", "february")
+    EXCLUDE_KW = ("energy_data", "releves_ai", "voie", "pdu", "releve_diane",
+                  "energy_per_model", "energy_summary", "energy_uptime",
+                  "unified_dataset")
+    dfs = []
+    for fname, path in local_paths.items():
+        fl = fname.lower()
+        if any(kw in fl for kw in EXCLUDE_KW):
+            print(f"  [SKIP] {fname}")
+            continue
+        if not any(kw in fl for kw in USAGE_KW):
+            continue
+        try:
+            df = pd.read_csv(path)
+            print(f"  Loaded local: {fname} ({len(df):,} rows)")
+            dfs.append(df)
+        except Exception as e:
+            print(f"  [ERR] {fname}: {e}")
+
+    if not dfs:
         return None
 
-
-def build_params_map(models, use_hf):
-    """
-    Build a {model_name: params_B} map for all models in the dataset.
-
-    Priority for each model:
-      1. HuggingFace Hub (if use_hf=True and repo is mapped)
-      2. MODEL_PARAMS_B_KNOWN (manually verified values)
-      3. Excluded – no value invented, results will show NaN
-    """
-    params_map = {}
-    excluded = []
-    for model in sorted(models):
-        hf_repo = MODEL_HF_REPO.get(model)
-        if use_hf and hf_repo:
-            val = fetch_hf_params(model, hf_repo)
-            if val is not None:
-                params_map[model] = val
-                continue
-        if model in MODEL_PARAMS_B_KNOWN:
-            src = "known" if not hf_repo else "known (HF has no safetensors)"
-            print(f"  [OK]   {model}: {MODEL_PARAMS_B_KNOWN[model]}B ({src})")
-            params_map[model] = MODEL_PARAMS_B_KNOWN[model]
-            continue
-        reason = "internal model" if not hf_repo else "not found on HF"
-        print(f"  [SKIP] {model}: excluded ({reason})")
-        excluded.append(model)
-    return params_map, excluded
-
-# ==============================================================================
-# 4. Load data from S3
-# ==============================================================================
-
-def load_usage(fs, bucket, files):
-    """Load and concatenate usage CSV files from S3."""
-    dfs = []
-    for f in files:
-        print(f"  Reading: s3://{bucket}/{f}")
-        with fs.open(f"{bucket}/{f}") as fh:
-            dfs.append(pd.read_csv(fh))
     usage = pd.concat(dfs, ignore_index=True)
-    usage.columns = usage.columns.str.strip()
+    usage.columns     = usage.columns.str.strip()
     usage["Date"]         = pd.to_datetime(usage["Date"])
     usage["Total Tokens"] = pd.to_numeric(usage["Total Tokens"], errors="coerce").fillna(0)
     usage["Requests"]     = pd.to_numeric(usage["Requests"],     errors="coerce").fillna(0)
     usage["Spend ($)"]    = pd.to_numeric(usage["Spend ($)"],    errors="coerce").fillna(0)
+    usage = usage.drop_duplicates(subset=["Date", "Model"]).reset_index(drop=True)
+    _check_token_granularity(usage)
     return usage
 
+def _auto_dt(df, source_name):
+    """Detect and rename the datetime column; parse to UTC-aware datetime."""
+    for c in df.columns:
+        if any(kw in c.lower() for kw in ("datetime","date","time","timestamp","horodatage")):
+            if c != "Datetime":
+                print(f"    [INFO] '{c}' -> 'Datetime'")
+                df = df.rename(columns={c: "Datetime"})
+            df["Datetime"] = pd.to_datetime(df["Datetime"], utc=True, errors="coerce")
+            return df
+    raise ValueError(f"No datetime column in {source_name}. Columns: {list(df.columns)}")
 
-def load_energy(fs, bucket, energy_file):
-    """Load GPU power measurements from S3."""
-    print(f"  Reading: s3://{bucket}/{energy_file}")
-    with fs.open(f"{bucket}/{energy_file}") as fh:
-        df = pd.read_csv(fh)
-    df["Input Active Power Total (W)"] = pd.to_numeric(
-        df["Input Active Power Total (W)"], errors="coerce"
-    )
-    df["Datetime"] = pd.to_datetime(df["Datetime"], utc=True)
+def load_energy_dec(fs, bucket, filename, local=False):
+    """
+    Load Energy_Data_Clean.csv (Dec 2025 PDU snapshot).
+    Accepts either a local path (local=True) or an S3 path.
+    Returns a DataFrame with columns: Datetime, GPU, Input Active Power Total (W).
+    """
+    if local:
+        print(f"  Reading local: {filename}")
+        with open(filename, "rb") as fh:
+            df = pd.read_csv(fh)
+    else:
+        full_path = filename if not bucket else f"{bucket}/{filename}"
+        print(f"  Reading: s3://{full_path}")
+        with fs.open(full_path) as fh:
+            df = pd.read_csv(fh)
+
+    df.columns = df.columns.str.strip()
+    df = _auto_dt(df, filename)
+
+    # Rename the first column matching gpu/node/pdu keywords to 'GPU'
+    gpu_cands = [
+        c for c in df.columns
+        if any(kw in c.lower() for kw in ("gpu","node","pdu","voie","circuit","rack"))
+        and c != "Datetime"]
+    if gpu_cands and gpu_cands[0] != "GPU":
+        df = df.rename(columns={gpu_cands[0]: "GPU"})
+
+    for col in ["Input Active Power Total (W)", "Input Cumulated Energy Total (Wh)"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    n_gpu = df["GPU"].nunique() if "GPU" in df.columns else "?"
+    print(f"    Rows: {len(df):,} | GPU nodes: {n_gpu}")
     return df
 
-# ==============================================================================
-# 5. Energy calculations
-# ==============================================================================
-
-def compute(usage, energy, params_map, excluded):
+def load_energy_feb(fs, bucket, filename, local=False):
     """
-    Compute energy and CO2 per model.
-
-    Method:
-      - Cluster power: average of PDU readings across all 6 GPU nodes
-      - Total energy: cluster_power × 24h × uptime_days
-      - Uptime uncertainty: two scenarios shown side by side
-          · Optimistic  – only days with recorded requests (cluster off otherwise)
-          · Pessimistic – full calendar range (cluster always on)
-          · Central     – average of the two
-      - Energy per model: proportional to compute weight = tokens × params_B
-        (proxy for FLOPs: more parameters = more matrix multiplications per token)
-      - CO2: energy_facility × CO2_FACTOR  (facility = IT energy × PUE)
-
-    Limitations:
-      - PDU measurement covers only 80 minutes (3 Dec 2025) – assumed representative
-      - PUE = 1.7 is a standard estimate; real datacenter value unknown
-      - Compute weight is a proxy, not a direct measurement
-      - Models excluded due to missing parameter data are not estimated
+    Load releves_AI_FEB_2026.csv (Feb 2026 cumulative PDU counter).
+    Derives ID_Voie from the source_file column, then computes per-circuit
+    energy as the sum of consecutive positive differences (discarding resets).
+    Returns (df_raw, total_energy_wh, energy_per_voie_df).
     """
-    # Cluster power from PDU readings
-    power_per_gpu   = energy.groupby("GPU")["Input Active Power Total (W)"].mean()
-    cluster_power_w = power_per_gpu.sum()
+    if local:
+        print(f"  Reading local: {filename}")
+        with open(filename, "rb") as fh:
+            df = pd.read_csv(fh)
+    else:
+        full_path = filename if not bucket else f"{bucket}/{filename}"
+        print(f"  Reading: s3://{full_path}")
+        with fs.open(full_path) as fh:
+            df = pd.read_csv(fh)
 
-    # Uptime scenarios
-    dates_with_data    = usage["Date"].drop_duplicates().sort_values()
-    n_days_optimistic  = len(dates_with_data)
-    n_days_pessimistic = (dates_with_data.max() - dates_with_data.min()).days + 1
+    df.columns = df.columns.str.strip()
+    df = _auto_dt(df, filename)
 
-    def kwh(days): return cluster_power_w * 24 * days / 1000
+    if "source_file" in df.columns:
+        df["ID_Voie"] = (
+            df["source_file"]
+            .str.replace(".csv", "", regex=False)
+            .str.rsplit("_", n=1).str[0])
+    elif "ID_Voie" not in df.columns:
+        df["ID_Voie"] = "single_circuit"
+        print("    [WARN] No source_file column -- treating as single circuit")
 
-    energy_it = {
-        "optimistic":  kwh(n_days_optimistic),
-        "central":     kwh((n_days_optimistic + n_days_pessimistic) / 2),
-        "pessimistic": kwh(n_days_pessimistic),
-    }
-    energy_fac = {k: v * PUE for k, v in energy_it.items()}
+    energy_col = "Input Cumulated Energy Total (Wh)"
+    power_col  = "Input Active Power Total (W)"
+    for col in [energy_col, power_col]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    # Aggregate usage by model
+    if energy_col not in df.columns:
+        print("    [WARN] No cumulative energy column -- cannot compute diff")
+        return df, None, None
+
+    df = df.sort_values(["ID_Voie", "Datetime"]).reset_index(drop=True)
+    df["energy_diff_wh"] = df.groupby("ID_Voie")[energy_col].diff()
+
+    n_resets = (df["energy_diff_wh"] < 0).sum()
+    if n_resets:
+        print(f"    [INFO] {n_resets} reset events filtered")
+    df_valid = df[df["energy_diff_wh"] >= 0].copy()
+
+    energy_per_voie = (
+        df_valid.groupby("ID_Voie")["energy_diff_wh"]
+        .sum().reset_index()
+        .rename(columns={"energy_diff_wh": "total_wh"}))
+    total_wh = energy_per_voie["total_wh"].sum()
+
+    print(f"    Circuits (ID_Voie) : {df['ID_Voie'].nunique()}")
+    print(f"    Rows               : {len(df):,} ({len(df_valid):,} valid)")
+    print(f"    Total energy (diff): {total_wh/1000:,.1f} kWh")
+    if power_col in df.columns:
+        print(f"    Avg active power   : {df[power_col].dropna().mean():,.0f} W")
+
+    return df, total_wh, energy_per_voie
+
+def _parse_pdu_filename(fname):
+    """
+    Extract circuit metadata from a PDU filename.
+    E.g. '101_J37_Voie1_20260210.csv' -> {rack: J37, voie: Voie1, ...}
+    """
+    base  = os.path.splitext(os.path.basename(fname))[0]
+    parts = base.split("_")
+    rack    = parts[1] if len(parts) > 1 else "unknown"
+    voie    = parts[2] if len(parts) > 2 else "unknown"
+    datestr = parts[3] if len(parts) > 3 else ""
+    return {
+        "rack":        rack,
+        "voie":        voie,
+        "circuit_id":  f"{rack}_{voie}",
+        "source_file": base,
+        "file_date":   datestr,}
+
+def _load_pdu_files_local(local_files):
+    """Load PDU circuit CSVs from a dict of local paths extracted from zip."""
+    PAT = re.compile(r"[0-9]+_[A-Z][0-9]+_Voie[0-9]+_[0-9]+\.csv$", re.IGNORECASE)
+    dfs = []
+    for fname, path in sorted(local_files.items()):
+        if not PAT.search(fname):
+            continue
+        try:
+            df = pd.read_csv(path)
+            df.columns = df.columns.str.strip()
+            for k, v in _parse_pdu_filename(fname).items():
+                df[k] = v
+            dfs.append(df)
+            print(f"    {fname}: {len(df):,} rows")
+        except Exception as e:
+            print(f"    [ERR] {fname}: {e}")
+    if not dfs:
+        return pd.DataFrame()
+    combined = pd.concat(dfs, ignore_index=True)
+    n_circ = combined["circuit_id"].nunique()
+    print(f"  PDU combined: {len(combined):,} rows | {n_circ} circuits")
+    return combined
+
+def _load_pdu_files_s3(fs, available):
+    """Load PDU circuit CSVs directly from S3 available-files dict."""
+    PAT = re.compile(r"[0-9]+_[A-Z][0-9]+_Voie[0-9]+_[0-9]+\.csv$", re.IGNORECASE)
+    dfs = []
+    for fname, fpath in sorted(available.items()):
+        if not PAT.search(fname):
+            continue
+        try:
+            with fs.open(fpath) as fh:
+                df = pd.read_csv(fh)
+            df.columns = df.columns.str.strip()
+            for k, v in _parse_pdu_filename(fname).items():
+                df[k] = v
+            dfs.append(df)
+            print(f"    {fname}: {len(df):,} rows")
+        except Exception as e:
+            print(f"    [ERR] {fname}: {e}")
+    if not dfs:
+        return pd.DataFrame()
+    combined = pd.concat(dfs, ignore_index=True)
+    print(f"  PDU combined: {len(combined):,} rows | {combined['circuit_id'].nunique()} circuits")
+    return combined
+
+def build_unified_dataset(fs, bucket, usage, df_pdu, output_key="diane_unified_dataset.csv"):
+    """
+    Build a daily unified dataset: usage stats + PDU energy per day.
+    Saves to S3 and returns the DataFrame.
+    Columns: Date, total_requests, total_tokens, total_spend, n_models,
+             pdu_it_kwh_total, pdu_n_circuits, pdu_avg_power_w,
+             facility_kwh, co2_kg_day, wh_per_req, kwh_per_mtok
+    """
+    print("  Building unified dataset...")
+
+    usage_daily = (
+        usage.groupby("Date")
+        .agg(
+            total_requests=("Requests",     "sum"),
+            total_tokens  =("Total Tokens", "sum"),
+            total_spend   =("Spend ($)",    "sum"),
+            n_models      =("Model",        "nunique"),)
+        .reset_index())
+
+    if df_pdu.empty:
+        print("  [WARN] No PDU circuit data -- energy columns will be NaN")
+        unified = usage_daily
+    else:
+        dt_col  = next(
+            (c for c in df_pdu.columns
+             if any(kw in c.lower() for kw in ("datetime","date","time","horodatage"))),
+            None)
+        eng_col = next(
+            (c for c in df_pdu.columns if "cumul" in c.lower() and "wh" in c.lower()),
+            None)
+        pwr_col = next(
+            (c for c in df_pdu.columns if "active" in c.lower() and "power" in c.lower()),
+            None)
+
+        if dt_col:
+            df_pdu[dt_col] = pd.to_datetime(df_pdu[dt_col], utc=True, errors="coerce")
+            df_pdu["Date"] = df_pdu[dt_col].dt.normalize().dt.tz_localize(None)
+
+        unified = usage_daily.copy()
+
+        if eng_col:
+            df_pdu[eng_col] = pd.to_numeric(df_pdu[eng_col], errors="coerce")
+            cir_day = (
+                df_pdu.groupby(["circuit_id", "Date"])[eng_col]
+                .agg(["min", "max"]).reset_index())
+            cir_day["kwh_day"] = ((cir_day["max"] - cir_day["min"]) / 1000).clip(lower=0)
+            energy_agg = (
+                cir_day.groupby("Date")
+                .agg(pdu_it_kwh_total=("kwh_day", "sum"),
+                     pdu_n_circuits  =("circuit_id", "nunique"))
+                .reset_index())
+            unified = unified.merge(energy_agg, on="Date", how="left")
+
+        if pwr_col:
+            df_pdu[pwr_col] = pd.to_numeric(df_pdu[pwr_col], errors="coerce")
+            power_agg = (
+                df_pdu.groupby("Date")[pwr_col]
+                .mean().reset_index()
+                .rename(columns={pwr_col: "pdu_avg_power_w"}))
+            unified = unified.merge(power_agg, on="Date", how="left")
+
+    if "pdu_it_kwh_total" in unified.columns:
+        unified["facility_kwh"] = unified["pdu_it_kwh_total"] * PUE
+        unified["co2_kg_day"]   = unified["facility_kwh"] * CO2_FACTOR
+        unified["wh_per_req"]   = unified["facility_kwh"] * 1000 / unified["total_requests"]
+        unified["kwh_per_mtok"] = unified["facility_kwh"] / (unified["total_tokens"] / 1e6)
+
+    unified = unified.sort_values("Date").reset_index(drop=True)
+
+    try:
+        with fs.open(f"{bucket}/{output_key}", "w") as fh:
+            unified.to_csv(fh, index=False)
+        print(f"  -> Unified dataset saved: s3://{bucket}/{output_key}")
+        print(f"     {len(unified):,} rows | {len(unified.columns)} columns")
+        print(f"     Columns: {list(unified.columns)}")
+    except Exception as e:
+        unified.to_csv("diane_unified_dataset.csv", index=False)
+        print(f"  [WARN] S3 save failed ({e}) -- saved locally: diane_unified_dataset.csv")
+
+    return unified
+
+# 4. HuggingFace model parameter lookup
+
+def _hf_detect_dtype(config, model_name):
+    n = model_name.lower()
+    if "fp8" in n or "int8" in n: return "fp8"
+    if "int4" in n:               return "int4"
+    if "mxfp4" in n:              return "mxfp4_moe_90pct"
+    dtype = (config.get("torch_dtype") or "").lower()
+    if "float16"  in dtype: return "fp16"
+    if "bfloat16" in dtype: return "bf16"
+    if "float32"  in dtype: return "fp32"
+    return "bf16"
+
+def _hf_detect_moe(config):
+    n_exp = (config.get("num_experts") or config.get("num_local_experts")
+             or config.get("ffn_num_experts") or config.get("n_routed_experts"))
+    top_k = (config.get("num_experts_per_tok") or config.get("top_k_experts")
+             or config.get("num_selected_experts") or config.get("n_experts_per_token"))
+    is_moe = bool(n_exp) or any(
+        "moe" in a.lower() or "mixtral" in a.lower()
+        for a in config.get("architectures", []))
+    return is_moe, (int(n_exp) if n_exp else None), (int(top_k) if top_k else None)
+
+def fetch_hf_info(model_name, hf_repo, token=None):
+    """Fetch parameter count, dtype, and MoE config from HuggingFace Hub."""
+    result = {
+        "params_B": None,
+        "dtype":    MODEL_DTYPE.get(model_name, "bf16"),
+        "moe": False, "n_experts": None, "top_k": None,}
+    if not HF_AVAILABLE or hf_repo is None:
+        return result
+    try:
+        api  = HfApi(token=token)
+        info = api.model_info(hf_repo)
+        if info.safetensors and info.safetensors.total:
+            result["params_B"] = round(info.safetensors.total / 1e9, 3)
+            print(f"  [HF]   {model_name}: {result['params_B']:.3f}B (safetensors)")
+        try:
+            path = hf_hub_download(hf_repo, "config.json", token=token)
+            with open(path) as f:
+                config = json.load(f)
+        except Exception:
+            config = {}
+        if result["params_B"] is None:
+            for key in ("num_parameters", "n_params"):
+                if key in config:
+                    result["params_B"] = round(config[key] / 1e9, 3)
+                    print(f"  [HF]   {model_name}: {result['params_B']:.3f}B "
+                          f"(config.{key})")
+                    break
+        if result["params_B"] is None:
+            print(f"  [--]   {model_name}: no param data on HF")
+        if model_name not in MODEL_DTYPE:
+            result["dtype"] = _hf_detect_dtype(config, model_name)
+        is_moe, n_exp, top_k = _hf_detect_moe(config)
+        if is_moe:
+            result.update({"moe": True, "n_experts": n_exp, "top_k": top_k})
+            print(f"  [MoE]  {model_name}: {n_exp} experts top-{top_k} (auto)")
+    except hf_utils.GatedRepoError:
+        print(f"  [403]  {model_name}: gated, using fallback")
+    except hf_utils.RepositoryNotFoundError:
+        print(f"  [404]  {model_name}: not found ({hf_repo})")
+    except Exception as e:
+        print(f"  [ERR]  {model_name}: {e}")
+    return result
+
+def build_params_map(models, use_hf=True, hf_token=None):
+    """
+    Resolve parameter counts for all models.
+    Returns (params_map, excluded_list).
+    """
+    params_map, excluded = {}, []
+    for model in sorted(models):
+        hf_repo = MODEL_HF_REPO.get(model)
+        hf_data = (fetch_hf_info(model, hf_repo, token=hf_token)
+            if use_hf and hf_repo else {})
+        params_B = hf_data.get("params_B")
+        if params_B is None and model in MODEL_PARAMS_B_KNOWN:
+            params_B = MODEL_PARAMS_B_KNOWN[model]
+            src = "known" if not hf_repo else "known (HF empty)"
+            print(f"  [OK]   {model}: {params_B}B ({src})")
+        if params_B is None:
+            print(f"  [SKIP] {model}: excluded (no params)")
+            excluded.append(model)
+            continue
+        params_map[model] = params_B
+        if model not in MODEL_DTYPE and hf_data.get("dtype"):
+            MODEL_DTYPE[model] = hf_data["dtype"]
+        if (model not in MODEL_ACTIVE_PARAMS_B
+                and hf_data.get("moe")
+                and hf_data.get("n_experts")
+                and hf_data.get("top_k")):
+            f_moe = 0.85
+            eff = round((1 - f_moe) * params_B
+                + (hf_data["top_k"] / hf_data["n_experts"]) * f_moe * params_B,
+                3)
+            MODEL_ACTIVE_PARAMS_B[model] = eff
+            print(f"  [MoE]  {model}: eff params auto-set to {eff:.3f}B")
+    return params_map, excluded
+
+# 5. Energy and CO2 computation
+
+def _attribution_share(df_period, params_map):
+    """
+    Compute per-model attribution shares for a given usage period.
+    Returns {model: share} dict.  Shares sum to 1.0 for known models.
+    """
+    p = df_period.copy()
+    p["params_B"]     = p["Model"].map(params_map)
+    p["eff_params"]   = p["Model"].map(MODEL_ACTIVE_PARAMS_B).combine_first(p["params_B"])
+    p["quant_factor"] = p["Model"].map(MODEL_DTYPE).fillna("bf16").map(QUANT_FACTOR).fillna(1.0)
+    known = p["params_B"].notna()
+
+    p.loc[known, "vw"] = (
+        p.loc[known, "tokens"]
+        * p.loc[known, "eff_params"]
+        * p.loc[known, "quant_factor"])
+    tvw   = p.loc[known, "vw"].sum()
+    tdays = p.loc[known, "active_days"].sum()
+
+    if tvw > 0 and tdays > 0:
+        p.loc[known, "idle_sh"] = p.loc[known, "active_days"] / tdays
+        p.loc[known, "share"]   = (
+            (1 - IDLE_POWER_FRACTION) * p.loc[known, "vw"] / tvw
+            + IDLE_POWER_FRACTION     * p.loc[known, "idle_sh"])
+    else:
+        p.loc[known, "share"] = 0.0
+
+    return p[["Model", "share"]].set_index("Model")["share"].to_dict()
+
+def compute(usage, df_dec, df_feb_raw, df_feb_energy_wh, params_map, excluded):
+    """
+    Compute per-model energy and CO2 for the full Oct-2025/Feb-2026 period.
+    Returns (agg_df, energy_info_dict).
+    """
+    # Dec cluster power from PDU snapshot
+    gpu_col = next((c for c in df_dec.columns
+         if c in ("GPU", "NODE", "PDU")
+         or (df_dec[c].dtype == object and c != "Datetime")),
+        None)
+    cluster_power_w = df_dec.groupby(gpu_col)["Input Active Power Total (W)"].mean().sum()
+    n_gpu_nodes = df_dec[gpu_col].nunique()
+    print(f"  Dec cluster power  : {cluster_power_w:,.0f} W ({n_gpu_nodes} nodes)")
+
+    # Dec uptime scenarios
+    dates_dec = (usage[usage["Date"] <= "2025-12-31"]["Date"]
+                 .drop_duplicates().sort_values())
+    n_dec_opt = len(dates_dec)
+    n_dec_pes = (dates_dec.max() - dates_dec.min()).days + 1
+    n_dec_cen = (n_dec_opt + n_dec_pes) / 2
+
+    def _kwh(power_w, days):
+        return power_w * 24 * days / 1000
+
+    energy_it_dec = {
+        "optimistic":  _kwh(cluster_power_w, n_dec_opt),
+        "central":     _kwh(cluster_power_w, n_dec_cen),
+        "pessimistic": _kwh(cluster_power_w, n_dec_pes),}
+
+    # Feb energy
+    usage_feb  = usage[(usage["Date"] >= "2026-02-01") & (usage["Date"] <= "2026-02-28")]
+    dates_feb  = usage_feb["Date"].drop_duplicates().sort_values()
+    n_feb_opt  = len(dates_feb)
+    n_feb_pes  = int((dates_feb.max() - dates_feb.min()).days + 1) if len(dates_feb) else 0
+    n_feb_cen  = (n_feb_opt + n_feb_pes) / 2
+
+    # Sanity check: ratio > 3 indicates probable double-counting
+    _feb_raw = (df_feb_energy_wh / 1000) if df_feb_energy_wh else 0
+    _ref     = _kwh(cluster_power_w, n_feb_cen)
+    _ratio   = _feb_raw / _ref if _ref > 0 else 0
+
+    print(f"  Feb raw IT energy  : {_feb_raw:,.0f} kWh  (cumulative diff)")
+    print(f"  Dec-based reference: {_ref:,.0f} kWh  (cluster power × uptime)")
+    print(f"  Ratio raw/ref      : {_ratio:.1f}×  (expected ~1.0, >3 = likely overcount)")
+
+    if df_feb_energy_wh and df_feb_energy_wh > 0:
+        if _ratio > 3.0:
+            n_circuits = (
+                df_feb_raw["ID_Voie"].nunique()
+                if df_feb_raw is not None and "ID_Voie" in df_feb_raw.columns
+                else 1)
+            print(f"  [WARN] Ratio {_ratio:.1f}x > 3 -- probable double-count "
+                  f"({n_circuits} circuits). Falling back to Dec reference.")
+            feb_method = (f"Dec power reference (overcount guard: "
+                          f"ratio={_ratio:.1f}×, circuits={n_circuits})")
+            energy_it_feb = {sc: _kwh(cluster_power_w, n)
+                             for sc, n in [("optimistic", n_feb_opt),
+                                           ("central",    n_feb_cen),
+                                           ("pessimistic",n_feb_pes)]}
+        else:
+            feb_method    = f"direct measurement (cumulative diff): {_feb_raw:,.1f} kWh"
+            energy_it_feb = {k: _feb_raw for k in ("optimistic", "central", "pessimistic")}
+    else:
+        feb_method    = "Dec power reference × uptime scenarios (no Feb PDU data)"
+        energy_it_feb = {sc: _kwh(cluster_power_w, n)
+                         for sc, n in [("optimistic", n_feb_opt),
+                                       ("central",    n_feb_cen),
+                                       ("pessimistic",n_feb_pes)]}
+
+    print(f"  Feb energy method  : {feb_method}")
+    print(f"  Feb IT energy used : {energy_it_feb['central']:,.0f} kWh (central)")
+
+    energy_it_total  = {k: energy_it_dec[k] + energy_it_feb[k]
+                        for k in ("optimistic", "central", "pessimistic")}
+    energy_fac_total = {k: v * PUE for k, v in energy_it_total.items()}
+
+    # Aggregate usage
     agg = usage.groupby("Model").agg(
         total_requests=("Requests",     "sum"),
         total_tokens  =("Total Tokens", "sum"),
         total_spend   =("Spend ($)",    "sum"),
-        active_days   =("Date",         "nunique"),
-    ).reset_index()
+        active_days   =("Date",         "nunique"),).reset_index()
 
     agg["params_B"]      = agg["Model"].map(params_map)
-    agg["params_source"] = agg["params_B"].apply(
-        lambda x: "Known" if pd.notna(x) else "MISSING"
-    )
-
-    # Compute weight and energy share (only for models with known params)
+    agg["dtype"]         = agg["Model"].map(MODEL_DTYPE).fillna("bf16")
+    agg["quant_factor"]  = agg["dtype"].map(QUANT_FACTOR).fillna(1.0)
+    agg["active_params_B"]    = agg["Model"].map(MODEL_ACTIVE_PARAMS_B)
+    agg["effective_params_B"] = agg["active_params_B"].combine_first(agg["params_B"])
     known = agg["params_B"].notna()
-    agg.loc[known, "weight"]  = agg.loc[known, "total_tokens"] * agg.loc[known, "params_B"]
-    total_weight              = agg.loc[known, "weight"].sum()
-    agg.loc[known, "share"]   = agg.loc[known, "weight"] / total_weight
 
-    # Energy and CO2 for each scenario
-    for scenario in ["optimistic", "central", "pessimistic"]:
-        agg.loc[known, f"energy_fac_kWh_{scenario}"] = (
-            agg.loc[known, "share"] * energy_fac[scenario]
-        )
-        agg.loc[known, f"co2_kg_{scenario}"] = (
-            agg.loc[known, f"energy_fac_kWh_{scenario}"] * CO2_FACTOR
-        )
+    # FIX 3: idle
+    tot_days = agg.loc[known, "active_days"].sum()
+    agg.loc[known, "idle_share"] = agg.loc[known, "active_days"] / tot_days
+    agg.loc[known, "variable_weight"] = (
+        agg.loc[known, "total_tokens"]
+        * agg.loc[known, "effective_params_B"]
+        * agg.loc[known, "quant_factor"])
+    tvw = agg.loc[known, "variable_weight"].sum()
+    agg.loc[known, "variable_share"] = agg.loc[known, "variable_weight"] / tvw
+    agg.loc[known, "share"] = (
+        (1 - IDLE_POWER_FRACTION) * agg.loc[known, "variable_share"]
+        + IDLE_POWER_FRACTION     * agg.loc[known, "idle_share"])
 
-    # Central scenario as default columns + efficiency metrics
+    for sc in ("optimistic", "central", "pessimistic"):
+        agg.loc[known, f"energy_fac_kWh_{sc}"] = (
+            agg.loc[known, "share"] * energy_fac_total[sc])
+        agg.loc[known, f"co2_kg_{sc}"] = (agg.loc[known, f"energy_fac_kWh_{sc}"] * CO2_FACTOR)
+
     agg.loc[known, "energy_fac_kWh"] = agg.loc[known, "energy_fac_kWh_central"]
     agg.loc[known, "co2_kg"]         = agg.loc[known, "co2_kg_central"]
     agg.loc[known, "kWh_per_1M_tok"] = (
-        agg.loc[known, "energy_fac_kWh"] / (agg.loc[known, "total_tokens"] / 1e6)
-    )
-    agg.loc[known, "Wh_per_req"]     = (
-        agg.loc[known, "energy_fac_kWh"] * 1000 / agg.loc[known, "total_requests"]
-    )
-    agg.loc[known, "gCO2_per_req"]   = agg.loc[known, "Wh_per_req"] * CO2_FACTOR
+        agg.loc[known, "energy_fac_kWh"]
+        / (agg.loc[known, "total_tokens"] / 1e6))
+    agg.loc[known, "Wh_per_req"]   = (
+        agg.loc[known, "energy_fac_kWh"] * 1000 / agg.loc[known, "total_requests"])
+    agg.loc[known, "gCO2_per_req"] = agg.loc[known, "Wh_per_req"] * CO2_FACTOR
+
+    # Per-period attribution (dec / feb split)
+    fac_cen = energy_fac_total["central"]
+    fac_dec = fac_cen * energy_it_dec["central"] / energy_it_total["central"]
+    fac_feb = fac_cen * energy_it_feb["central"] / energy_it_total["central"]
+
+    for period_label, period_df, period_fac in [
+        ("dec", usage[usage["Date"] <= "2025-12-31"], fac_dec),
+        ("feb", usage_feb, fac_feb),]:
+        p = period_df.groupby("Model").agg(
+            tokens=(    "Total Tokens", "sum"),
+            requests=(  "Requests",     "sum"),
+            active_days=("Date",        "nunique"),
+        ).reset_index()
+        shares = _attribution_share(p, params_map)
+        agg[f"energy_{period_label}_kWh"] = agg["Model"].map(shares) * period_fac
+        agg[f"co2_{period_label}_kg"]     = (
+            agg[f"energy_{period_label}_kWh"] * CO2_FACTOR)
 
     agg = agg.sort_values(
-        "energy_fac_kWh", ascending=False, na_position="last"
-    ).reset_index(drop=True)
+        "energy_fac_kWh", ascending=False, na_position="last").reset_index(drop=True)
 
-    uptime = {
-        "n_days_optimistic":   n_days_optimistic,
-        "n_days_pessimistic":  n_days_pessimistic,
-        **{f"energy_it_{k}":  v for k, v in energy_it.items()},
-        **{f"energy_fac_{k}": v for k, v in energy_fac.items()},
-    }
+    print("\n  Attribution corrections applied:")
+    print(f"    FP8 models       : {agg.loc[agg['dtype']=='fp8', 'Model'].tolist()}")
+    print(f"    MXFP4-MoE models : {agg.loc[agg['dtype']=='mxfp4_moe_90pct', 'Model'].tolist()}")
+    print(f"    MoE active params: {agg.loc[agg['active_params_B'].notna(), 'Model'].tolist()}")
+    print(f"    Idle fraction    : {IDLE_POWER_FRACTION:.0%} via hosting days")
 
-    return agg, power_per_gpu, cluster_power_w, uptime
+    energy_info = {
+        "n_days_dec_opt":      n_dec_opt,
+        "n_days_dec_pes":      n_dec_pes,
+        "n_days_feb_opt":      n_feb_opt,
+        "n_days_feb_pes":      n_feb_pes,
+        "cluster_power_dec_w": cluster_power_w,
+        "feb_method":          feb_method,
+        **{f"energy_it_dec_{k[:3]}":  v for k, v in energy_it_dec.items()},
+        **{f"energy_it_feb_{k[:3]}":  v for k, v in energy_it_feb.items()},
+        **{f"energy_it_total_{k}":    v for k, v in energy_it_total.items()},
+        **{f"energy_fac_total_{k}":   v for k, v in energy_fac_total.items()},}
+    return agg, energy_info
 
-# ==============================================================================
-# 6. Plots
-# ==============================================================================
+def compute_feb_only(usage, df_feb_energy_wh, cluster_power_dec_w, params_map):
+    """
+    Compute per-model energy and CO2 for February 2026 only.
+    Uses direct PDU measurement when available; falls back to Dec power reference.
+    Returns a DataFrame (or empty DataFrame if no Feb usage data).
+    """
+    usage_feb = usage[
+        (usage["Date"] >= "2026-02-01") & (usage["Date"] <= "2026-02-28")].copy()
 
-def short(name):
-    """Shorten model names for chart labels."""
-    return (name.replace("/model/", "")
-                .replace("-Instruct", "").replace("-instruct", "")
-                .replace("-fp8-W8A16", "").replace("-FP8-dynamic", "")
-                .replace("-2501", ""))
+    if len(usage_feb) == 0:
+        print("  [WARN] No February usage data found")
+        return pd.DataFrame()
 
+    dates_feb = usage_feb["Date"].drop_duplicates().sort_values()
+    n_opt = len(dates_feb)
+    n_pes = int((dates_feb.max() - dates_feb.min()).days + 1)
+    n_cen = (n_opt + n_pes) / 2
 
-def plot_power_realtime(energy):
-    """Plot real-time GPU power from PDU readings."""
-    fig, ax = plt.subplots(figsize=(13, 4))
-    for gpu in sorted(energy["GPU"].unique()):
-        sub = energy[energy["GPU"] == gpu].sort_values("Datetime")
-        ax.plot(sub["Datetime"], sub["Input Active Power Total (W)"],
-                linewidth=1.5, label=gpu)
-    total = energy.groupby("Datetime")["Input Active Power Total (W)"].sum()
-    ax2 = ax.twinx()
-    ax2.plot(total.index, total.values, color="black", linewidth=2.5,
-             linestyle="--", label="Total cluster")
-    ax2.set_ylabel("Total cluster power (W)")
-    ax.set_title(
-        "Real-time GPU power per node – 3 Dec 2025 (PDU readings every 5 min)",
-        fontsize=12
-    )
-    ax.set_ylabel("Power per node (W)")
-    ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
-    ax.legend(loc="upper left", fontsize=8)
-    ax2.legend(loc="upper right", fontsize=9)
-    ax.grid(True, linestyle=":", alpha=0.5)
-    plt.tight_layout()
-    plt.savefig("plot_power_realtime.png", dpi=150, bbox_inches="tight")
-    plt.show()
-    print("  → plot_power_realtime.png")
-
-
-def plot_energy_by_model(agg):
-    """4-panel chart: total energy, total CO2, efficiency, CO2 per request."""
-    df = agg[agg["params_B"].notna()].copy()
-    fig, axes = plt.subplots(2, 2, figsize=(16, 11))
-    fig.suptitle(
-        f"DIANE – Energy consumption & CO₂ per model  "
-        f"(PUE={PUE}, {CO2_FACTOR} kg CO₂/kWh, central scenario)",
-        fontsize=13, fontweight="bold"
-    )
-    panels = [
-        (axes[0,0], "energy_fac_kWh", "kWh (facility, PUE 1.7)",
-         "Total energy consumed",          "{:,.0f}"),
-        (axes[0,1], "co2_kg",          "kg CO₂e",
-         "Total carbon footprint",         "{:,.1f}"),
-        (axes[1,0], "kWh_per_1M_tok",  "kWh / million tokens",
-         "Energy efficiency (↓ = better)", "{:,.2f}"),
-        (axes[1,1], "gCO2_per_req",    "g CO₂e per request",
-         "CO₂ per request",               "{:,.3f}"),
-    ]
-    for ax, col, xlabel, title, fmt in panels:
-        sub    = df.dropna(subset=[col])
-        names  = sub["Model"].apply(short)
-        colors = plt.cm.RdYlGn_r(np.linspace(0.15, 0.85, len(sub)))
-        bars   = ax.barh(names, sub[col], color=colors)
-        ax.set_xlabel(xlabel)
-        ax.set_title(title)
-        ax.bar_label(bars, labels=[fmt.format(v) for v in sub[col]],
-                     padding=3, fontsize=8)
-        ax.grid(axis="x", linestyle=":", alpha=0.5)
-    plt.tight_layout()
-    plt.savefig("plot_energy_by_model.png", dpi=150, bbox_inches="tight")
-    plt.show()
-    print("  → plot_energy_by_model.png")
-
-
-def plot_pie(agg, energy_it_central_kwh):
-    """Pie charts: share per model + IT vs datacenter overhead."""
-    df = agg[agg["params_B"].notna()].copy()
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
-    fig.suptitle("Energy distribution across the cluster", fontsize=13, fontweight="bold")
-
-    labels = df["Model"].apply(short)
-    ax1.pie(df["energy_fac_kWh"], labels=labels, autopct="%1.1f%%",
-            startangle=90, colors=plt.cm.tab10.colors[:len(df)])
-    ax1.set_title("Facility energy share per model")
-
-    overhead = energy_it_central_kwh * (PUE - 1)
-    ax2.pie(
-        [energy_it_central_kwh, overhead],
-        labels=[
-            f"IT servers\n{energy_it_central_kwh:,.0f} kWh",
-            f"Datacenter overhead\n(cooling, UPS, etc.)\n{overhead:,.0f} kWh",
-        ],
-        autopct="%1.1f%%", startangle=90, colors=["#4C72B0", "#DD8452"]
-    )
-    ax2.set_title(f"IT vs Overhead (PUE = {PUE})")
-    plt.tight_layout()
-    plt.savefig("plot_energy_split.png", dpi=150, bbox_inches="tight")
-    plt.show()
-    print("  → plot_energy_split.png")
-
-# ==============================================================================
-# 7. Summary
-# ==============================================================================
-
-def print_summary(agg, uptime):
-    """Print a summary table with all three uptime scenarios."""
-    u          = uptime
-    tot_req    = agg["total_requests"].sum()
-    tot_tok    = agg["total_tokens"].sum()
-    tot_spend  = agg["total_spend"].sum()
-    n_known    = agg["params_B"].notna().sum()
-    n_missing  = agg["params_B"].isna().sum()
-
-    print("=" * 65)
-    print("SUMMARY – DIANE Energy Analysis")
-    print("=" * 65)
-    print(f"Models with known parameters  : {n_known} / {len(agg)}")
-    print(f"Total requests                : {tot_req:,.0f}")
-    print(f"Total tokens                  : {tot_tok/1e9:.2f} billion")
-    print(f"Total spend                   : ${tot_spend:,.2f}")
-    print()
-    h = f"{'':32s} {'Optimistic':>12} {'Central':>12} {'Pessimistic':>13}"
-    s = f"{'':32s} {'(off w/o traffic)':>12} {'(average)':>12} {'(24/7)':>13}"
-    print(h)
-    print(s)
-    print("-" * 72)
-
-    rows = [
-        ("Uptime (days)",
-         u["n_days_optimistic"], (u["n_days_optimistic"]+u["n_days_pessimistic"])//2,
-         u["n_days_pessimistic"], "{:>12.0f}"),
-        ("IT energy (kWh)",
-         u["energy_it_optimistic"], u["energy_it_central"], u["energy_it_pessimistic"],
-         "{:>12,.0f}"),
-        ("Facility energy (kWh)",
-         u["energy_fac_optimistic"], u["energy_fac_central"], u["energy_fac_pessimistic"],
-         "{:>12,.0f}"),
-        ("CO₂ (kg)",
-         agg["co2_kg_optimistic"].sum(), agg["co2_kg"].sum(),
-         agg["co2_kg_pessimistic"].sum(), "{:>12,.1f}"),
-        ("Equiv. car distance (km)",
-         agg["co2_kg_optimistic"].sum()/120, agg["co2_kg"].sum()/120,
-         agg["co2_kg_pessimistic"].sum()/120, "{:>12,.0f}"),
-    ]
-    for label, opt, cen, pes, fmt in rows:
-        print(f"  {label:<30s} {fmt.format(opt)} {fmt.format(cen)} {fmt.format(pes)}")
-
-    print("-" * 72)
-    e = u["energy_fac_central"]
-    print(f"\nEfficiency metrics (central scenario):")
-    print(f"  Per request (avg)     : {e*1000/tot_req:.4f} Wh")
-    print(f"  Per million tokens    : {e/(tot_tok/1e6):.2f} kWh")
-    print(f"  Per dollar spent      : {e/tot_spend:.1f} kWh/$")
-    print("=" * 65)
-    print()
-    print("KNOWN LIMITATIONS:")
-    print(f"  - PDU measurement covers only 80 min (3 Dec 2025) – assumed representative")
-    print(f"  - Real uptime unknown: range is {u['n_days_optimistic']}–{u['n_days_pessimistic']} days")
-    print(f"  - PUE = {PUE} is an estimate; actual datacenter value unknown")
-    print(f"  - Energy attribution uses tokens × params proxy, not direct measurement")
-    if n_missing > 0:
-        missing = agg[agg["params_B"].isna()]["Model"].tolist()
-        print(f"  - {n_missing} model(s) excluded (missing parameter data): {missing}")
-
-# ==============================================================================
-# MAIN
-# ==============================================================================
-
-def main(use_hf=True, export=True):
-    sep = "=" * 55
-    print(sep)
-    print("DIANE Energy Analysis (Onyxia / S3)")
-    print(sep)
-
-    print("\n[0/6] Connecting to S3...")
-    fs = get_fs()
-    print(f"  Bucket   : s3://{S3_BUCKET}")
-    print(f"  Endpoint : {os.environ.get('S3_ENDPOINT', '?')}")
-
-    print("\n[1/6] Loading data from S3...")
-    usage  = load_usage(fs, S3_BUCKET, USAGE_FILES)
-    energy = load_energy(fs, S3_BUCKET, ENERGY_FILE)
-    print(f"  Usage  : {len(usage):,} rows | {usage['Model'].nunique()} models | "
-          f"{usage['Date'].min().date()} → {usage['Date'].max().date()}")
-    print(f"  Energy : {len(energy):,} rows | {energy['GPU'].nunique()} GPU nodes")
-
-    print(f"\n[2/6] Looking up model parameters "
-          f"{'(HuggingFace + fallback)' if use_hf else '(fallback only)'}...")
-    models = sorted(usage["Model"].unique())
-    params_map, excluded = build_params_map(models, use_hf)
-    print(f"  Models with data : {len(params_map)} | Excluded : {len(excluded)}")
-
-    print("\n[3/6] Computing energy estimates...")
-    agg, power_per_gpu, cluster_power_w, uptime = compute(
-        usage, energy, params_map, excluded
-    )
-    u = uptime
-    print(f"  Cluster power      : {cluster_power_w:.0f} W ({cluster_power_w/1000:.2f} kW IT)")
-    print(f"  Facility power     : {cluster_power_w*PUE:.0f} W (PUE {PUE})")
-    print(f"  Optimistic scenario: {u['n_days_optimistic']} days → "
-          f"{u['energy_fac_optimistic']:,.0f} kWh facility")
-    print(f"  Pessimistic scenario: {u['n_days_pessimistic']} days → "
-          f"{u['energy_fac_pessimistic']:,.0f} kWh facility")
-
-    print("\n[4/6] Summary...")
-    print_summary(agg, uptime)
-
-    print("\n[5/6] Generating charts...")
-    plot_power_realtime(energy)
-    plot_energy_by_model(agg)
-    plot_pie(agg, u["energy_it_central"])
-
-    if export:
-        print("\n[6/6] Exporting results to S3...")
-        out_path = f"{S3_BUCKET}/{OUTPUT_CSV}"
-        with fs.open(out_path, "w") as f:
-            agg.to_csv(f, index=False)
-        print(f"  → s3://{out_path}")
-        scenarios_df = pd.DataFrame([uptime])
-        with fs.open(f"{S3_BUCKET}/energy_uptime_scenarios.csv", "w") as f:
-            scenarios_df.to_csv(f, index=False)
-        print(f"  → s3://{S3_BUCKET}/energy_uptime_scenarios.csv")
+    if df_feb_energy_wh and df_feb_energy_wh > 0:
+        feb_it_kwh = df_feb_energy_wh / 1000
+        method = f"direct PDU diff: {feb_it_kwh:,.1f} kWh IT"
     else:
-        print("\n[6/6] Export skipped (--no-export)")
+        feb_it_kwh = cluster_power_dec_w * 24 * n_cen / 1000
+        method = f"Dec power × {n_cen:.1f} days: {feb_it_kwh:,.1f} kWh IT"
 
-    print("\nDone.")
+    feb_fac_kwh = feb_it_kwh * PUE
+    feb_co2_kg  = feb_fac_kwh * CO2_FACTOR
+
+    print("\n  Feb-only energy:")
+    print(f"    IT energy : {feb_it_kwh:,.1f} kWh  ({method})")
+    print(f"    Facility  : {feb_fac_kwh:,.1f} kWh  (×PUE {PUE})")
+    print(f"    CO2       : {feb_co2_kg:,.1f} kg CO2e")
+
+    agg = usage_feb.groupby("Model").agg(
+        total_requests=("Requests",     "sum"),
+        total_tokens  =("Total Tokens", "sum"),
+        active_days   =("Date",         "nunique"),).reset_index()
+
+    agg["params_B"]        = agg["Model"].map(params_map)
+    agg["dtype"]           = agg["Model"].map(MODEL_DTYPE).fillna("bf16")
+    agg["quant_factor"]    = agg["dtype"].map(QUANT_FACTOR).fillna(1.0)
+    agg["active_params_B"] = agg["Model"].map(MODEL_ACTIVE_PARAMS_B)
+    agg["eff_params_B"]    = agg["active_params_B"].combine_first(agg["params_B"])
+    known = agg["params_B"].notna()
+
+    tot_days = agg.loc[known, "active_days"].sum()
+    agg.loc[known, "var_weight"] = (
+        agg.loc[known, "total_tokens"]
+        * agg.loc[known, "eff_params_B"]
+        * agg.loc[known, "quant_factor"])
+    tvw = agg.loc[known, "var_weight"].sum()
+    agg.loc[known, "idle_share"] = agg.loc[known, "active_days"] / tot_days
+    agg.loc[known, "var_share"]  = agg.loc[known, "var_weight"] / tvw
+    agg.loc[known, "share"] = (
+        (1 - IDLE_POWER_FRACTION) * agg.loc[known, "var_share"]
+        + IDLE_POWER_FRACTION     * agg.loc[known, "idle_share"])
+    agg.loc[known, "energy_fac_kWh"] = agg.loc[known, "share"] * feb_fac_kwh
+    agg.loc[known, "co2_kg"]         = agg.loc[known, "energy_fac_kWh"] * CO2_FACTOR
+    agg.loc[known, "kWh_per_1M_tok"] = (
+        agg.loc[known, "energy_fac_kWh"] / (agg.loc[known, "total_tokens"] / 1e6))
+    agg.loc[known, "Wh_per_req"]   = (
+        agg.loc[known, "energy_fac_kWh"] * 1000 / agg.loc[known, "total_requests"])
+    agg.loc[known, "gCO2_per_req"] = agg.loc[known, "Wh_per_req"] * CO2_FACTOR
+
+    agg = agg[known].sort_values("energy_fac_kWh", ascending=False).reset_index(drop=True)
+    agg["feb_it_kwh"]  = feb_it_kwh
+    agg["feb_fac_kwh"] = feb_fac_kwh
+    agg["feb_co2_kg"]  = feb_co2_kg
+    agg["feb_method"]  = method
+    agg["n_days_feb"]  = n_cen
     return agg
 
+# 6. Plots
+
+PALETTE = ["#1F6FEB", "#E87D2B", "#2BA84A", "#D64045",
+           "#7C4DBC", "#0AADAD", "#F5A623", "#9B59B6", "#34495E"]
+C_BG    = "#F8F9FA"
+C_GRID  = "#E8ECF0"
+C_TEXT  = "#1A2332"
+C_MUTED = "#6B7A8D"
+
+def _style():
+    plt.rcParams.update({
+        "axes.spines.top":   False, "axes.spines.right": False,
+        "axes.facecolor":    C_BG,  "figure.facecolor":  "white",
+        "axes.grid":         True,  "grid.color":        C_GRID,
+        "grid.linestyle":    ":",   "grid.alpha":        0.6,
+        "font.family":       "sans-serif",
+        "axes.labelcolor":   C_TEXT, "xtick.color": C_MUTED, "ytick.color": C_MUTED,})
+
+def short(name):
+    """Return a shortened display name for a model."""
+    return (
+        name.replace("/model/", "")
+            .replace("-Instruct", "").replace("-instruct", "")
+            .replace("-fp8-W8A16", "").replace("-FP8-dynamic", "")
+            .replace("-2501", "")
+            .replace("Qwen2.5-Coder", "Qwen-Coder")
+            .replace("faster-whisper-large-v3-turbo-ct2", "Whisper-v3"))
+
+def save(fig, name, fs=None, bucket=None):
+    """Save figure locally and optionally upload to S3."""
+    local = f"{name}.png"
+    fig.savefig(local, dpi=150, bbox_inches="tight")
+    print(f"  -> {local}")
+    if fs and bucket:
+        fs.put(local, f"{bucket}/{local}")
+        print(f"     s3://{bucket}/{local}")
+    plt.close(fig)
+
+def plot_power_dec(df_dec, fs=None, bucket=None):
+    """Plot 1: real-time power per PDU circuit from December snapshot.
+
+    Each row in Energy_Data_Clean.csv has a unique timestamp (circuits are
+    read sequentially, not simultaneously), so groupby(Datetime).sum() always
+    returns single-circuit values.  The cluster total is computed as the sum
+    of per-circuit means instead.
+    """
+    _style()
+    gpu_col = next(
+        (c for c in df_dec.columns
+         if c in ("GPU", "NODE", "PDU")
+         or (df_dec[c].dtype == object and c != "Datetime")),
+        None)
+    if not gpu_col:
+        return
+
+    pcol    = "Input Active Power Total (W)"
+    gpus    = sorted(df_dec[gpu_col].unique())
+    n_nodes = len(gpus)
+
+    # Cluster total = sum of per-circuit means (timestamps are not aligned)
+    cluster_mean_w = df_dec.groupby(gpu_col)[pcol].mean().sum()
+
+    fig, ax = plt.subplots(figsize=(13, 4))
+    for i, gpu in enumerate(gpus):
+        sub = df_dec[df_dec[gpu_col] == gpu].sort_values("Datetime")
+        ax.plot(sub["Datetime"], sub[pcol],
+                linewidth=1.5, label=str(gpu), color=PALETTE[i % len(PALETTE)])
+
+    # Draw cluster total as a horizontal reference line (not a time series,
+    # since timestamps differ per circuit)
+    ax.axhline(cluster_mean_w / n_nodes, color="black", linewidth=1.5,
+               linestyle=":", alpha=0.5, label=f"Per-circuit avg ({cluster_mean_w/n_nodes:.0f} W)")
+
+    ax.set_title(
+        f"Dec 2025 -- PDU power per circuit (80-min snapshot) | "
+        f"Cluster total: {cluster_mean_w:,.0f} W avg ({n_nodes} circuits)",
+        fontsize=11, fontweight="bold",)
+    ax.set_ylabel("Active power per circuit (W)")
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
+    ax.legend(loc="upper left", fontsize=8, ncol=2)
+    # Annotate cluster total in top-right corner
+    label = (f"Cluster total\n"
+             f"{cluster_mean_w:,.0f} W avg\n"
+             f"({n_nodes} circuits x {cluster_mean_w/n_nodes:.0f} W)")
+    ax.text(0.99, 0.96, label,
+            transform=ax.transAxes, ha="right", va="top",
+            fontsize=9, color="black",
+            bbox=dict(boxstyle="round,pad=0.3", facecolor="white",
+                      edgecolor="grey", alpha=0.8))
+    plt.tight_layout()
+    save(fig, "plot1_power_dec", fs, bucket)
+
+def plot_power_feb(df_feb, fs=None, bucket=None):
+    """Plot 2: Feb 2026 PDU active power -- hourly average timeline."""
+    _style()
+    pcol = "Input Active Power Total (W)"
+    if pcol not in df_feb.columns:
+        return
+    hourly = (
+        df_feb[["Datetime", pcol]].dropna()
+        .sort_values("Datetime").set_index("Datetime")[pcol]
+        .resample("1h").mean())
+    fig, ax = plt.subplots(figsize=(14, 4))
+    ax.fill_between(hourly.index, hourly.values, alpha=0.3, color=PALETTE[0])
+    ax.plot(hourly.index, hourly.values, color=PALETTE[0], linewidth=1.3)
+    ax.axhline(hourly.mean(), color=PALETTE[3], linewidth=1.5, linestyle="--",
+               label=f"Mean: {hourly.mean():.0f} W")
+    if len(hourly):
+        for d in pd.date_range(
+            hourly.index[0].normalize(),
+            hourly.index[-1].normalize() + pd.Timedelta(days=1),
+            freq="D"):
+            if d.weekday() >= 5:
+                ax.axvspan(d, d + pd.Timedelta(days=1),
+                           color=C_GRID, alpha=0.5, zorder=0)
+    ax.set_title("Feb 2026 -- PDU active power (hourly avg)",
+                 fontsize=12, fontweight="bold")
+    ax.set_ylabel("Active power (W)")
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%d %b"))
+    ax.xaxis.set_major_locator(mdates.WeekdayLocator(interval=1))
+    plt.setp(ax.xaxis.get_majorticklabels(), rotation=30, ha="right")
+    ax.legend(fontsize=10)
+    plt.tight_layout()
+    save(fig, "plot2_power_feb", fs, bucket)
+
+def plot_co2_by_model(agg, fs=None, bucket=None):
+    """Plot 3: CO2 per model -- horizontal bar chart (central scenario, full period)."""
+    _style()
+    df = agg[agg["params_B"].notna()].sort_values("co2_kg", ascending=True)
+    fig, ax = plt.subplots(figsize=(13, 6))
+    bars = ax.barh(
+        df["Model"].apply(short), df["co2_kg"],
+        color=[PALETTE[i % len(PALETTE)] for i in range(len(df))],
+        edgecolor="white", linewidth=0.5, height=0.65,)
+    ax.bar_label(bars, labels=[f"{v:,.1f} kg" for v in df["co2_kg"]],
+                 padding=5, fontsize=9)
+    ax.set_xlabel("CO2 emissions (kg CO2e)", fontsize=11)
+    ax.set_title(f"CO2 per model -- central scenario  (PUE={PUE}, {CO2_FACTOR} kg/kWh)",
+                 fontsize=12, fontweight="bold")
+    ax.set_xlim(right=df["co2_kg"].max() * 1.20)
+    plt.tight_layout()
+    save(fig, "plot3_co2_by_model", fs, bucket)
+
+def plot_energy_by_model(agg, fs=None, bucket=None):
+    """Plot 4: 4-panel -- energy / CO2 / kWh per Mtok / gCO2 per req (full period)."""
+    _style()
+    df = agg[agg["params_B"].notna()].sort_values("energy_fac_kWh", ascending=True)
+    fig, axes = plt.subplots(2, 2, figsize=(17, 11))
+    fig.suptitle(
+        "DIANE -- energy & CO2 per model  (central scenario, Oct 2025 -- Feb 2026)",
+        fontsize=13, fontweight="bold", y=1.01,)
+    for ax, col, xlabel, title, fmt in [
+        (axes[0, 0], "energy_fac_kWh", "kWh (facility)", "Total facility energy", "{:,.0f}"),
+        (axes[0, 1], "co2_kg",         "kg CO2e",        "Carbon footprint",       "{:,.1f}"),
+        (axes[1, 0], "kWh_per_1M_tok", "kWh / M tokens", "Efficiency (↓ = better)","{:,.2f}"),
+        (axes[1, 1], "gCO2_per_req",   "g CO2e / req",   "CO2 per request",        "{:,.3f}"),]:
+        sub  = df.dropna(subset=[col])
+        vals = sub[col].values
+        bars = ax.barh(
+            sub["Model"].apply(short), vals,
+            color=[PALETTE[i % len(PALETTE)] for i in range(len(sub))],
+            edgecolor="white", linewidth=0.4, height=0.6,)
+        ax.bar_label(bars, labels=[fmt.format(v) for v in vals], padding=4, fontsize=8.5)
+        ax.set_xlabel(xlabel, fontsize=10)
+        ax.set_title(title, fontsize=11, fontweight="bold")
+        ax.set_xlim(right=vals.max() * 1.22)
+        ax.tick_params(labelsize=9)
+    plt.tight_layout()
+    save(fig, "plot4_energy_by_model", fs, bucket)
+
+def plot_emissions_by_period(agg, energy_info, fs=None, bucket=None):
+    """Plot 5: CO2 per model stacked by period (Dec vs Feb), + period totals."""
+    _style()
+    df = agg[agg["params_B"].notna()].copy()
+    if "co2_dec_kg" not in df.columns:
+        df["co2_dec_kg"] = df["co2_kg"] * 0.85
+    if "co2_feb_kg" not in df.columns:
+        df["co2_feb_kg"] = df["co2_kg"] * 0.15
+    df = df.sort_values("co2_kg", ascending=True)
+    names   = df["Model"].apply(short).tolist()
+    co2_dec = df["co2_dec_kg"].fillna(0).values
+    co2_feb = df["co2_feb_kg"].fillna(0).values
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(17, 7),
+                                   gridspec_kw={"width_ratios": [3, 1]})
+    fig.suptitle("CO2 emissions per model split by period  (central scenario)",
+                 fontsize=13, fontweight="bold")
+    ax1.barh(names, co2_dec, color=PALETTE[0], label="Oct-Dec 2025",
+             edgecolor="white", linewidth=0.4, height=0.6)
+    ax1.barh(names, co2_feb, left=co2_dec, color=PALETTE[1], label="Feb 2026",
+             edgecolor="white", linewidth=0.4, height=0.6)
+    for i, (d, f) in enumerate(zip(co2_dec, co2_feb)):
+        ax1.text(d + f + co2_dec.max() * 0.01, i, f"{d+f:,.1f}",
+                 va="center", fontsize=8.5)
+    ax1.set_xlabel("CO2 (kg CO2e)", fontsize=11)
+    ax1.set_title("Per-model split", fontsize=11, fontweight="bold")
+    ax1.legend(fontsize=10, loc="lower right")
+    ax1.set_xlim(right=(co2_dec + co2_feb).max() * 1.22)
+
+    ei = energy_info
+    tot_cen  = ei["energy_fac_total_central"]
+    fac_dec  = tot_cen * ei["energy_it_dec_cen"] / ei["energy_it_total_central"]
+    fac_feb  = tot_cen * ei["energy_it_feb_cen"] / ei["energy_it_total_central"]
+    c_dec    = fac_dec * CO2_FACTOR
+    c_feb    = fac_feb * CO2_FACTOR
+    ax2.bar(["Oct-Dec\n2025", "Feb\n2026"], [c_dec, c_feb],
+            color=[PALETTE[0], PALETTE[1]], edgecolor="white", width=0.5)
+    for i, v in enumerate([c_dec, c_feb]):
+        ax2.text(i, v + max(c_dec, c_feb) * 0.02, f"{v:,.0f} kg",
+                 ha="center", fontsize=10, fontweight="bold")
+    ax2.set_ylabel("CO2 (kg CO2e)", fontsize=10)
+    ax2.set_title("Period totals\n(cluster)", fontsize=11, fontweight="bold")
+    ax2.set_ylim(top=max(c_dec, c_feb) * 1.28)
+    plt.tight_layout()
+    save(fig, "plot5_emissions_by_period", fs, bucket)
+
+def plot_co2_period_grouped(agg, fs=None, bucket=None):
+    """Plot 6: CO2 per model per period -- grouped horizontal bars."""
+    _style()
+    df = agg[agg["params_B"].notna()].copy()
+    if "co2_dec_kg" not in df.columns:
+        df["co2_dec_kg"] = df["co2_kg"] * 0.85
+    if "co2_feb_kg" not in df.columns:
+        df["co2_feb_kg"] = df["co2_kg"] * 0.15
+    df = df.sort_values("co2_kg", ascending=False)
+    n = len(df)
+    y = np.arange(n)
+    h = 0.38
+    fig, ax = plt.subplots(figsize=(13, 7))
+    ax.barh(y + h/2, df["co2_dec_kg"].values, h, color=PALETTE[0],
+            label="Oct-Dec 2025", edgecolor="white")
+    ax.barh(y - h/2, df["co2_feb_kg"].values, h, color=PALETTE[1],
+            label="Feb 2026", edgecolor="white")
+    ax.set_yticks(y)
+    ax.set_yticklabels(df["Model"].apply(short).tolist(), fontsize=9)
+    for i, row in df.reset_index(drop=True).iterrows():
+        ax.text(
+            max(row["co2_dec_kg"], row["co2_feb_kg"]) + df["co2_kg"].max() * 0.01,
+            i, f"total: {row['co2_kg']:,.0f}", va="center", fontsize=8, color=C_MUTED,)
+    ax.set_xlabel("CO2 (kg CO2e)", fontsize=11)
+    ax.set_title("CO2 per model per period -- grouped  (central scenario)",
+                 fontsize=12, fontweight="bold")
+    ax.legend(fontsize=10)
+    plt.tight_layout()
+    save(fig, "plot6_co2_period_grouped", fs, bucket)
+
+def plot_scenarios(agg, energy_info, fs=None, bucket=None):
+    """Plot 7: uptime scenario uncertainty -- CO2 and facility energy."""
+    _style()
+    ei = energy_info
+    sc        = ["optimistic", "central", "pessimistic"]
+    sc_labels = ["Optimistic\n(off w/o traffic)", "Central\n(average)", "Pessimistic\n(24/7)"]
+    co2_vals  = [agg[f"co2_kg_{s}"].sum() for s in sc]
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 5))
+    fig.suptitle("Uptime uncertainty -- impact on energy & CO2",
+                 fontsize=13, fontweight="bold")
+    bars = ax1.bar(sc_labels, co2_vals,
+                   color=[PALETTE[2], PALETTE[1], PALETTE[3]],
+                   width=0.5, edgecolor="white")
+    ax1.bar_label(bars, labels=[f"{v:,.0f} kg" for v in co2_vals], padding=5, fontsize=10)
+    ax1.set_ylabel("Total CO2 (kg CO2e)")
+    ax1.set_ylim(0, max(co2_vals) * 1.20)
+    ax1.set_title("Total CO2 by scenario", fontsize=11, fontweight="bold")
+
+    dec_fac = [ei[f"energy_it_dec_{s[:3]}"] * PUE for s in sc]
+    feb_fac = [ei[f"energy_it_feb_{s[:3]}"] * PUE for s in sc]
+    ax2.bar(sc_labels, dec_fac, color=PALETTE[0], width=0.5, label="Oct-Dec 2025")
+    ax2.bar(sc_labels, feb_fac, bottom=dec_fac, color=PALETTE[4],
+            width=0.5, label="Feb 2026")
+    for i, (d, f) in enumerate(zip(dec_fac, feb_fac)):
+        ax2.text(i, d + f + max(dec_fac) * 0.02, f"{d+f:,.0f}",
+                 ha="center", fontsize=9)
+    ax2.set_ylabel("Facility energy (kWh)")
+    ax2.legend(fontsize=9)
+    ax2.set_title("Facility energy by period & scenario", fontsize=11, fontweight="bold")
+    plt.tight_layout()
+    save(fig, "plot7_scenarios", fs, bucket)
+
+def plot_attribution_corrections(agg, fs=None, bucket=None):
+    """Plot 8: naive vs corrected attribution share -- shows impact of 3 FIXes."""
+    _style()
+    df = agg[agg["params_B"].notna()].copy()
+    df["naive_weight"] = df["total_tokens"] * df["params_B"]
+    df["naive_share"]  = df["naive_weight"] / df["naive_weight"].sum()
+    df = df.sort_values("naive_share", ascending=True)
+    n = len(df)
+    y = np.arange(n)
+    h = 0.35
+    fig, ax = plt.subplots(figsize=(13, 7))
+    ax.barh(y - h/2, df["naive_share"] * 100, h, color=C_MUTED, alpha=0.7,
+            label="Naive (total params only)", edgecolor="white")
+    ax.barh(y + h/2, df["share"] * 100, h,
+            color=[PALETTE[i % len(PALETTE)] for i in range(n)],
+            label="Corrected (eff. params + quant + idle)", edgecolor="white")
+    for i, row in df.reset_index(drop=True).iterrows():
+        delta = (row["share"] - row["naive_share"]) * 100
+        col   = PALETTE[2] if delta > 0 else PALETTE[3]
+        ax.text(
+            max(row["naive_share"], row["share"]) * 100 + 0.3,
+            i, f"{delta:+.1f}pp", va="center", fontsize=8, color=col,)
+    ax.set_yticks(y)
+    ax.set_yticklabels(df["Model"].apply(short).tolist(), fontsize=9)
+    ax.set_xlabel("Attribution share (%)", fontsize=11)
+    ax.set_title(
+        "Attribution correction impact\n"
+        "(naive vs corrected: MoE + quantisation + idle power)",
+        fontsize=12, fontweight="bold",)
+    ax.legend(fontsize=10)
+    plt.tight_layout()
+    save(fig, "plot8_attribution_corrections", fs, bucket)
+
+def plot_daily_usage(usage, fs=None, bucket=None):
+    """Plot 9: daily requests and tokens timeline (full period)."""
+    _style()
+    daily = (
+        usage.groupby("Date")
+        .agg(requests=("Requests", "sum"), tokens=("Total Tokens", "sum"))
+        .reset_index().sort_values("Date"))
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 7), sharex=True)
+    fig.suptitle("DIANE -- daily platform usage (Oct 2025 -- Feb 2026)",
+                 fontsize=13, fontweight="bold")
+    ax1.fill_between(daily["Date"], daily["requests"] / 1000,
+                     alpha=0.4, color=PALETTE[0])
+    ax1.plot(daily["Date"], daily["requests"] / 1000,
+             color=PALETTE[0], linewidth=1.3)
+    ax1.set_ylabel("Requests (k/day)", fontsize=10)
+    ax1.axvspan(pd.Timestamp("2026-01-01"), pd.Timestamp("2026-02-01"),
+                color=C_GRID, alpha=0.7, label="Jan 2026 (no data)")
+    ax1.legend(fontsize=9)
+    ax2.fill_between(daily["Date"], daily["tokens"] / 1e6,
+                     alpha=0.4, color=PALETTE[1])
+    ax2.plot(daily["Date"], daily["tokens"] / 1e6,
+             color=PALETTE[1], linewidth=1.3)
+    ax2.set_ylabel("Tokens (M/day)", fontsize=10)
+    ax2.axvspan(pd.Timestamp("2026-01-01"), pd.Timestamp("2026-02-01"),
+                color=C_GRID, alpha=0.7)
+    ax2.xaxis.set_major_formatter(mdates.DateFormatter("%b %Y"))
+    ax2.xaxis.set_major_locator(mdates.MonthLocator())
+    plt.setp(ax2.xaxis.get_majorticklabels(), rotation=30, ha="right")
+    plt.tight_layout()
+    save(fig, "plot9_daily_usage", fs, bucket)
+
+def plot_results_table(agg, energy_info, fs=None, bucket=None):
+    """
+    Plot 10: per-model results table (Feb-only view when energy_info signals it).
+    Columns: Model | Share | kWh | CO2 | kWh/Mtok | Wh/req | gCO2/req
+    """
+    _style()
+    df = (agg[agg["params_B"].notna()]
+          .sort_values("energy_fac_kWh", ascending=False).copy())
+
+    col_labels = ["Model", "Share", "kWh", "CO₂ (kg)", "kWh/Mtok", "Wh/req", "gCO₂/req"]
+    rows = []
+    for _, r in df.iterrows():
+        rows.append([
+            short(r["Model"]),
+            f"{r['share']*100:.0f}%",
+            f"{r['energy_fac_kWh']:,.0f}",
+            f"{r['co2_kg']:,.0f}",
+            f"{r['kWh_per_1M_tok']:.2f}",
+            f"{r['Wh_per_req']:.2f}",
+            f"{r['gCO2_per_req']:.3f}",])
+
+    ei      = energy_info
+    tot_fac = ei["energy_fac_total_central"]
+    tot_co2 = agg["co2_kg"].sum()
+    tot_tok = agg["total_tokens"].sum()
+    tot_req = agg["total_requests"].sum()
+    rows.append([
+        "Total", "100%",
+        f"{tot_fac:,.0f}", f"{tot_co2:,.0f}",
+        f"{tot_fac/(tot_tok/1e6):.2f}",
+        f"{tot_fac*1000/tot_req:.2f}",
+        f"{tot_fac*1000/tot_req*CO2_FACTOR:.3f}",
+    ])
+
+    fig, ax = plt.subplots(figsize=(14, 0.55 * (len(rows) + 2)))
+    ax.axis("off")
+    fig.patch.set_facecolor("white")
+    tbl = ax.table(cellText=rows, colLabels=col_labels,
+                   loc="center", cellLoc="right")
+    tbl.auto_set_font_size(False)
+    tbl.set_fontsize(10)
+    tbl.scale(1, 1.6)
+    for j in range(len(col_labels)):
+        tbl[0, j].set_facecolor(PALETTE[0])
+        tbl[0, j].set_text_props(color="white", fontweight="bold")
+        tbl[0, j].set_edgecolor("white")
+    for i in range(1, len(rows) + 1):
+        is_total = i == len(rows)
+        for j in range(len(col_labels)):
+            cell = tbl[i, j]
+            if is_total:
+                cell.set_facecolor("#1F6FEB")
+                cell.set_text_props(color="white", fontweight="bold")
+            elif i % 2 == 0:
+                cell.set_facecolor("#EEF3FB")
+            else:
+                cell.set_facecolor("white")
+            cell.set_edgecolor("#CCCCCC")
+        tbl[i, 0].set_text_props(ha="left")
+    tbl[0, 0].set_text_props(ha="left")
+
+    has_feb = ei.get("n_days_feb_opt", 0) > 0
+    has_dec = ei.get("n_days_dec_opt", 0) > 0
+    period  = "1--24 Feb 2026" if (has_feb and not has_dec) else "Oct 2025 -- Feb 2026"
+    # Detect team-level token export (kWh/Mtok not meaningful in that case)
+    tok_unique = df.groupby("Model")["total_tokens"].sum().nunique() if "total_tokens" in df.columns else 1
+    team_export_note = "  (*kWh/Mtok: team-level export)" if tok_unique == 1 else ""
+    overcount_flag = " ⚠ OVERCOUNT GUARD" if "overcount guard" in ei.get("feb_method", "") else ""
+    feb_it  = ei.get("energy_it_total_central", 1)
+    feb_fac_share = (
+        ei.get("energy_fac_total_central", 0) * ei.get("energy_it_feb_cen", 0) / feb_it
+        if feb_it > 0 else 0)
+    feb_note = (
+        f" | Feb only: {feb_fac_share:,.0f} kWh"
+        if has_dec and has_feb else "")
+    fig.suptitle(
+        f"Results per model -- {period}   "
+        f"(facility: {tot_fac:,.0f} kWh | CO₂: {tot_co2:,.0f} kg | "
+        f"PUE={PUE} | {CO2_FACTOR} kg/kWh{feb_note}){overcount_flag}{team_export_note}",
+        fontsize=11, fontweight="bold", y=0.98,)
+    plt.tight_layout()
+    # Remove stale PNG before regenerating to avoid serving a cached version
+    if os.path.exists("plot10_results_table.png"):
+        os.remove("plot10_results_table.png")
+    save(fig, "plot10_results_table", fs, bucket)
+
+def plot_corrections_table(agg, fs=None, bucket=None):
+    """Plot 11: attribution corrections summary (precision / MoE / idle)."""
+    _style()
+    fig = plt.figure(figsize=(12, 7))
+    fig.patch.set_facecolor("white")
+
+    def _section_table(ax, rows, labels, bbox):
+        t = ax.table(cellText=rows, colLabels=labels,
+                     loc="lower center", cellLoc="left", bbox=bbox)
+        t.auto_set_font_size(False)
+        t.set_fontsize(10)
+        t.scale(1, 1.5)
+        for j in range(len(labels)):
+            t[0, j].set_facecolor(PALETTE[0])
+            t[0, j].set_text_props(color="white", fontweight="bold")
+        for i in range(1, len(rows) + 1):
+            bg = "#EEF3FB" if i % 2 == 0 else "white"
+            for j in range(len(labels)):
+                t[i, j].set_facecolor(bg)
+                t[i, j].set_edgecolor("#CCCCCC")
+
+    # Layout (bottom-to-top, leaving 8% at top for suptitle):
+    #   ax3 (idle power)  : 0.01 -> 0.26  (height 0.25)
+    #   gap                       0.04
+    #   ax2 (MoE)         : 0.30 -> 0.57  (height 0.27)
+    #   gap                       0.05
+    #   ax1 (precision)   : 0.62 -> 0.92  (height 0.30)
+    #   suptitle          : y=0.98
+    # Each section heading sits at y=1.0 (top of its own axes), not y>1.
+
+    ax1 = fig.add_axes([0.04, 0.62, 0.92, 0.30])
+    ax1.axis("off")
+    ax1.text(0, 1.0, "1.  Numerical precision  ($q_i$)",
+             fontsize=12, fontweight="bold", transform=ax1.transAxes, va="bottom")
+    ax1.text(0, 0.82, "Lower precision  =  fewer FLOPs per token:",
+             fontsize=10, color="#444444", transform=ax1.transAxes)
+    _section_table(
+        ax1,
+        [["BF16 / FP16", "1.00", "Llama, qwen3vl, Whisper, gte"],
+         ["FP8",         "0.50", "Qwen-Coder, Mistral"],
+         ["MXFP4-MoE",   "0.34", "gptoss120b, gptoss20b"]],
+        ["Format", "$q_i$", "Models"],
+        [0, 0, 1, 0.68],)
+
+    ax2 = fig.add_axes([0.04, 0.30, 0.92, 0.27])
+    ax2.axis("off")
+    ax2.text(0, 1.0, "2.  Mixture-of-Experts (MoE)",
+             fontsize=12, fontweight="bold", transform=ax2.transAxes, va="bottom")
+    ax2.text(0, 0.82,
+             "Only a few experts fire per token -- effective compute << total parameters:",
+             fontsize=10, color="#444444", transform=ax2.transAxes)
+    _section_table(
+        ax2,
+        [["gptoss120b", "120B", "15B", "128 experts, top-4"],
+         ["gptoss20b",  " 22B", " 5B", " 32 experts, top-4"]],
+        ["Model", "Total params", "Active params", "Architecture"],
+        [0, 0, 1, 0.60],)
+
+    ax3 = fig.add_axes([0.04, 0.01, 0.92, 0.24])
+    ax3.axis("off")
+    ax3.text(0, 1.0, "3.  GPU idle power",
+             fontsize=12, fontweight="bold", transform=ax3.transAxes, va="bottom")
+    ax3.text(
+        0, 0.72,
+        "A100 GPUs stay in high-power state (P0) even with no active requests (~50 W idle).\n"
+        "7% of cluster energy is allocated by hosting time ($d_i$), not by token volume.",
+        fontsize=10, color="#444444", transform=ax3.transAxes, linespacing=1.6,)
+    ax3.text(
+        0, 0.15,
+        r"$s_i \;=\; 0.93 \cdot \dfrac{w_i}{\sum_j w_j} \;+\; 0.07 \cdot \dfrac{d_i}{\sum_j d_j}$",
+        fontsize=11, color="#1F6FEB", transform=ax3.transAxes,)
+    fig.suptitle("Attribution corrections applied to the energy model",
+                 fontsize=13, fontweight="bold", y=0.98)
+    save(fig, "plot11_corrections_table", fs, bucket)
+
+def plot_donut_energy(agg, energy_info, fs=None, bucket=None):
+    """
+    Plot 12: donut chart -- facility energy share per model + KPI breakdown panel.
+    """
+    _style()
+    ei     = energy_info
+    df     = (agg[agg["params_B"].notna()]
+              .sort_values("energy_fac_kWh", ascending=False).copy())
+    vals   = df["energy_fac_kWh"].values
+    names  = df["Model"].apply(short).tolist()
+    colors = [PALETTE[i % len(PALETTE)] for i in range(len(df))]
+
+    tot_fac  = ei["energy_fac_total_central"]
+    # it_kwh is always derived from tot_fac to stay consistent with
+    # whichever period (Feb-only or Oct-Feb) the caller passed in.
+    # Using energy_it_total_central would give Oct-Feb totals even in
+    # the Feb-only view, producing percentages > 100%.
+    it_kwh   = tot_fac / PUE
+    overhead = tot_fac - it_kwh   # = it_kwh * (PUE - 1)
+    tot_co2  = agg["co2_kg"].sum()
+    car_km   = tot_co2 / 0.12
+
+    fig = plt.figure(figsize=(16, 7))
+    fig.patch.set_facecolor("white")
+    has_dec = ei.get("n_days_dec_opt", 0) > 0
+    period  = "1--24 Feb 2026" if not has_dec else "Oct 2025 -- Feb 2026"
+
+    # ── Figure layout 
+    # Leave the top 12% of the figure for the suptitle (y goes 0..1 bottom-up).
+    # Axes start at y=0.05 and end at y=0.88 to give the title room above.
+    TOP    = 0.88
+    BOTTOM = 0.05
+
+    fig.suptitle(
+        f"Energy distribution -- central scenario   |   {period}   |   "
+        f"facility energy (kWh, PUE = {PUE:.1f})",
+        fontsize=11, fontweight="bold",
+        x=0.5, y=0.97, ha="center",)
+
+    # ── Left panel: donut 
+    ax_donut = fig.add_axes([0.01, BOTTOM, 0.52, TOP - BOTTOM])
+    ax_donut.set_title("A   Facility energy share per model",
+                       fontsize=10, fontweight="bold", loc="left", pad=6)
+    wedges, _ = ax_donut.pie(
+        vals, colors=colors, startangle=90,
+        wedgeprops=dict(width=0.55, edgecolor="white", linewidth=1.5),
+        counterclock=False,)
+    ax_donut.text(0, 0, f"{tot_fac:,.0f}\nkWh total",
+                  ha="center", va="center", fontsize=13, fontweight="bold",
+                  color="#1A2332")
+    ax_donut.legend(
+        wedges, [f"{n}  {v/tot_fac*100:.1f}%" for n, v in zip(names, vals)],
+        loc="lower left", fontsize=8.5,
+        bbox_to_anchor=(-0.18, -0.12), frameon=True,
+        title="Model", title_fontsize=9,)
+
+    # ── Right panel: KPI cards 
+    ax_kpi = fig.add_axes([0.56, BOTTOM, 0.42, TOP - BOTTOM])
+    ax_kpi.axis("off")
+    ax_kpi.set_title("B   Facility energy breakdown",
+                     fontsize=10, fontweight="bold", loc="left", pad=6)
+
+    # Mini donut: IT vs overhead
+    # Position relative to figure (not ax_kpi) to avoid clipping
+    ax_mini = fig.add_axes([0.60, 0.48, 0.19, 0.38])
+    ax_mini.pie(
+        [it_kwh, overhead], colors=["#4C72B0", "#DD8452"],
+        startangle=90,
+        wedgeprops=dict(width=0.50, edgecolor="white", linewidth=1.5),
+        counterclock=False,)
+    ax_mini.text(0, 0, f"IT: {it_kwh/tot_fac*100:.0f}%\nOH: {overhead/tot_fac*100:.0f}%",
+                 ha="center", va="center", fontsize=8, color="#333333")
+
+    # Annotations to the right of the mini donut
+    ax_kpi.text(0.52, 0.91,
+                f"IT {it_kwh:,.0f} kWh  ({it_kwh/tot_fac*100:.0f}%)",
+                transform=ax_kpi.transAxes, fontsize=9, color="#4C72B0")
+    ax_kpi.text(0.52, 0.81,
+                f"Overhead {overhead:,.0f} kWh  ({overhead/tot_fac*100:.0f}%)",
+                transform=ax_kpi.transAxes, fontsize=9, color="#DD8452")
+
+    # KPI cards (3 coloured boxes)
+    for idx, (label, value, color) in enumerate([
+        ("Total facility energy", f"{tot_fac:,.0f} kWh",    "#1F6FEB"),
+        ("Total CO₂",            f"{tot_co2:,.0f} kg CO₂e", "#E03C3C"),
+        ("Equiv. car distance",  f"≈ {car_km:,.0f} km",     "#2BA84A"),
+    ]):
+        y = 0.38 - idx * 0.16
+        ax_kpi.add_patch(plt.Rectangle(
+            (0.0, y - 0.04), 0.96, 0.12,
+            transform=ax_kpi.transAxes, facecolor=color, alpha=0.10, clip_on=False,
+        ))
+        ax_kpi.text(0.03, y + 0.04, label, transform=ax_kpi.transAxes,
+                    fontsize=9, color="#555555")
+        ax_kpi.text(0.03, y - 0.01, value, transform=ax_kpi.transAxes,
+                    fontsize=14, fontweight="bold", color=color)
+
+    if os.path.exists("plot12_donut_energy.png"):
+        os.remove("plot12_donut_energy.png")
+    save(fig, "plot12_donut_energy", fs, bucket)
+
+# 7. Summary
+
+def print_summary(agg, energy_info):
+    ei        = energy_info
+    tot_req   = agg["total_requests"].sum()
+    tot_tok   = agg["total_tokens"].sum()
+    tot_spend = agg["total_spend"].sum()
+    n_known   = agg["params_B"].notna().sum()
+    n_missing = agg["params_B"].isna().sum()
+
+    print("=" * 78)
+    print("SUMMARY -- DIANE Energy Analysis  (Oct 2025 -- Feb 2026)")
+    print("=" * 78)
+    print(f"  Models resolved        : {n_known} / {len(agg)}")
+    print(f"  Total requests         : {tot_req:,.0f}")
+    print(f"  Total tokens           : {tot_tok/1e9:.2f} billion")
+    print(f"  Total spend            : ${tot_spend:,.2f}")
+    print(f"  Feb energy method      : {ei.get('feb_method', '?')}")
+    print()
+    print("  --- February 2026 results ---")
+    print("-" * 78)
+    for label, opt, cen, pes, fmt in [
+        ("Dec uptime (days)",
+         ei["n_days_dec_opt"], n_cen(ei["n_days_dec_opt"], ei["n_days_dec_pes"]),
+         ei["n_days_dec_pes"], "{:>13.0f}"),
+        ("Feb uptime (days)",
+         ei["n_days_feb_opt"], n_cen(ei["n_days_feb_opt"], ei["n_days_feb_pes"]),
+         ei["n_days_feb_pes"], "{:>13.0f}"),
+        ("Dec IT energy (kWh)",
+         ei["energy_it_dec_opt"], ei["energy_it_dec_cen"], ei["energy_it_dec_pes"],
+         "{:>13,.0f}"),
+        ("Feb IT energy (kWh)",
+         ei["energy_it_feb_opt"], ei["energy_it_feb_cen"], ei["energy_it_feb_pes"],
+         "{:>13,.0f}"),
+        ("Total facility energy (kWh)",
+         ei["energy_fac_total_optimistic"], ei["energy_fac_total_central"],
+         ei["energy_fac_total_pessimistic"], "{:>13,.0f}"),
+        ("Total CO2 (kg CO2e)",
+         agg["co2_kg_optimistic"].sum(), agg["co2_kg"].sum(),
+         agg["co2_kg_pessimistic"].sum(), "{:>13,.1f}"),
+        ("Equiv. car distance (km)",
+         agg["co2_kg_optimistic"].sum() / 0.12, agg["co2_kg"].sum() / 0.12,
+         agg["co2_kg_pessimistic"].sum() / 0.12, "{:>13,.0f}"),]:
+        print(f"  {label:<34s} {fmt.format(opt)} {fmt.format(cen)} {fmt.format(pes)}")
+
+    print("-" * 78)
+    e = ei["energy_fac_total_central"]
+    print(f"\n  Efficiency (central): {e*1000/tot_req:.4f} Wh/req | "
+          f"{e/(tot_tok/1e6):.2f} kWh/Mtok | {e/tot_spend:.1f} kWh/$")
+    print("=" * 78)
+    if n_missing:
+        print(f"\n  [WARN] {n_missing} model(s) excluded: "
+              f"{agg[agg['params_B'].isna()]['Model'].tolist()}")
+
+# 8. Main
+
+def main(use_hf=True, export=True, hf_token=None):
+    sep = "=" * 60
+    print(sep); print("DIANE Energy Analysis (Onyxia / S3)"); print(sep)
+
+    # ── [0] Credentials and S3 connection 
+    print("\n[0/7] Connecting to S3...")
+    _check_credentials()
+    fs = get_fs()
+    print(f"  s3://{S3_BUCKET}  |  endpoint: {os.environ.get('S3_ENDPOINT', '?')}")
+
+    # ── [1] Load all data 
+    print(f"\n[1/7] Loading data from s3://{S3_BUCKET}/{S3_SUBFOLDER.strip()} ...")
+    available   = list_data_files(fs)
+    local_files = {}
+
+    # Primary: extract from zip
+    if any(f.strip() == ZIP_FILENAME.strip() for f in available):
+        print(f"\n  Zip found: {ZIP_FILENAME}")
+        local_files = download_and_extract_zip(fs)
+    else:
+        print("  [INFO] Zip not found -- loading CSVs directly from S3")
+
+    # Usage
+    usage = load_csv_local(local_files) if local_files else None
+    if usage is None:
+        # Fallback: direct S3 read
+        dfs = []
+        for fname in USAGE_FILES:
+            fpath = (s3_path(fname) if fname in available
+                     else next(
+                         (s3_path(k) for k in available
+                          if fname.lower().replace(" ", "") in k.lower().replace(" ", "")),
+                         None))
+            if fpath:
+                try:
+                    with fs.open(fpath) as fh:
+                        df = pd.read_csv(fh)
+                    print(f"  Loaded: {fname} ({len(df):,} rows)")
+                    dfs.append(df)
+                except Exception as e:
+                    print(f"  [ERR] {fname}: {e}")
+        if dfs:
+            usage = pd.concat(dfs, ignore_index=True)
+            usage.columns     = usage.columns.str.strip()
+            usage["Date"]         = pd.to_datetime(usage["Date"])
+            usage["Total Tokens"] = pd.to_numeric(usage["Total Tokens"], errors="coerce").fillna(0)
+            usage["Requests"]     = pd.to_numeric(usage["Requests"],     errors="coerce").fillna(0)
+            usage["Spend ($)"]    = pd.to_numeric(usage["Spend ($)"],    errors="coerce").fillna(0)
+            usage = usage.drop_duplicates(subset=["Date", "Model"]).reset_index(drop=True)
+
+    if usage is None or len(usage) == 0:
+        raise FileNotFoundError(
+            f"No usage data loaded.\n"
+            f"Files in s3://{S3_BUCKET}/{S3_SUBFOLDER.strip()}: {list(available.keys())}")
+    print(f"  Usage: {len(usage):,} rows | {usage['Model'].nunique()} models | "
+          f"{usage['Date'].min().date()} -> {usage['Date'].max().date()}")
+
+    # Dec energy
+    dec_local = local_files.get(ENERGY_FILE_DEC)
+    if dec_local:
+        print(f"  Loading Dec energy from zip: {ENERGY_FILE_DEC}")
+        df_dec = load_energy_dec(None, None, dec_local, local=True)
+    else:
+        df_dec = load_energy_dec(fs, "", s3_path(ENERGY_FILE_DEC))
+
+    # Feb energy
+    feb_local = local_files.get(ENERGY_FILE_FEB)
+    if feb_local:
+        print(f"  Loading Feb energy from zip: {ENERGY_FILE_FEB}")
+        df_feb_raw, df_feb_energy_wh, _ = load_energy_feb(
+            None, None, feb_local, local=True)
+    else:
+        df_feb_raw, df_feb_energy_wh, _ = load_energy_feb(
+            fs, "", s3_path(ENERGY_FILE_FEB))
+
+    # ── [1b] PDU circuit files → unified dataset 
+    print("\n[1b/7] Loading PDU circuit files & building unified dataset...")
+    if local_files:
+        df_pdu = _load_pdu_files_local(local_files)
+    else:
+        df_pdu = _load_pdu_files_s3(fs, available)
+
+    if df_pdu.empty:
+        print("  [WARN] No PDU circuit files found -- unified dataset will lack energy columns")
+
+    unified = build_unified_dataset(fs, S3_BUCKET, usage, df_pdu)
+    print(f"  Unified dataset: {len(unified):,} rows | {len(unified.columns)} cols")
+
+    # ── [2] Model parameters
+    mode_str = "HF+fallback" if use_hf else "fallback only"
+    print(f"\n[2/7] Resolving model parameters ({mode_str})...")
+    params_map, excluded = build_params_map(
+        sorted(usage["Model"].unique()), use_hf=use_hf, hf_token=hf_token)
+    print(f"  Resolved: {len(params_map)} | Excluded: {len(excluded)}")
+
+    # ── [3] Energy and CO2 computation (February only) 
+    print("\n[3/7] Computing Feb energy & CO2...")
+    agg_feb = compute_feb_only(
+        usage, df_feb_energy_wh,
+        cluster_power_dec_w=df_dec.groupby(
+            next(c for c in df_dec.columns
+                 if c in ("GPU","NODE","PDU")
+                 or (df_dec[c].dtype == object and c != "Datetime"))
+        )["Input Active Power Total (W)"].mean().sum(),
+        params_map=params_map,)
+    if agg_feb.empty:
+        raise RuntimeError("compute_feb_only returned empty -- check February usage data.")
+    feb_fac_v = agg_feb["feb_fac_kwh"].iloc[0]
+    feb_co2_v = agg_feb["feb_co2_kg"].iloc[0]
+    print(f"  Feb facility energy: {feb_fac_v:,.0f} kWh | CO2: {feb_co2_v:,.0f} kg")
+    # Build energy_info dict expected by summary and remaining plots
+    ei = {
+        "energy_fac_total_central":  feb_fac_v,
+        "energy_it_total_central":   feb_fac_v / PUE,
+        "energy_it_feb_cen":         feb_fac_v / PUE,
+        "energy_it_dec_cen":         0,
+        "energy_fac_total_optimistic": feb_fac_v,
+        "energy_fac_total_pessimistic":feb_fac_v,
+        "n_days_dec_opt": 0, "n_days_dec_pes": 0,
+        "n_days_feb_opt": int(agg_feb["n_days_feb"].iloc[0]),
+        "n_days_feb_pes": int(agg_feb["n_days_feb"].iloc[0]),
+        "cluster_power_dec_w": df_dec.groupby(
+            next(c for c in df_dec.columns
+                 if c in ("GPU","NODE","PDU")
+                 or (df_dec[c].dtype == object and c != "Datetime"))
+        )["Input Active Power Total (W)"].mean().sum(),
+        "feb_method": agg_feb["feb_method"].iloc[0],}
+    agg = agg_feb.copy()  # all downstream code uses agg
+    # add scenario columns expected by print_summary
+    for sc in ("optimistic", "central", "pessimistic"):
+        agg[f"co2_kg_{sc}"] = agg["co2_kg"]
+        agg[f"energy_fac_kWh_{sc}"] = agg["energy_fac_kWh"]
+    energy_info = ei
+
+    # ── [4] Summary
+    print("\n[4/7] Summary...")
+    print_summary(agg, energy_info)
+
+    # ── [5] Plots 
+    print("\n[5/7] Generating 3 charts (10, 11, 12)...")
+    bucket_out = S3_BUCKET if export else None
+    # Plots 1-9 are available as standalone functions but not generated by default.
+    # Only plots 10, 11, 12 are generated: results table, corrections, donut.
+    _ei_feb = {
+        "energy_fac_total_central":  ei["energy_fac_total_central"],
+        "energy_it_total_central":   ei["energy_it_total_central"],
+        "energy_it_feb_cen":         ei["energy_it_feb_cen"],
+        "n_days_feb_opt":            ei["n_days_feb_opt"],
+        "n_days_dec_opt":            0,
+        "feb_method":                ei["feb_method"],
+        "cluster_power_dec_w":       ei["cluster_power_dec_w"],}
+    plot_results_table(agg, _ei_feb, fs, bucket_out)
+    plot_corrections_table(agg, fs, bucket_out)
+    plot_donut_energy(agg, _ei_feb, fs, bucket_out)
+
+    # ── [6] Export
+    if export:
+        print("\n[6/7] Exporting to S3...")
+        with fs.open(f"{S3_BUCKET}/{OUTPUT_CSV}", "w") as f:
+            agg.to_csv(f, index=False)
+        with fs.open(f"{S3_BUCKET}/{OUTPUT_SUMMARY}", "w") as f:
+            pd.DataFrame([energy_info]).to_csv(f, index=False)
+        print(f"  -> s3://{S3_BUCKET}/{OUTPUT_CSV}")
+        print(f"  -> s3://{S3_BUCKET}/{OUTPUT_SUMMARY}")
+    else:
+        print("\n[6/7] Export skipped (--no-export)")
+
+    print("\n[7/7] Done.")
+    return agg, energy_info
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="DIANE Energy Analysis – Per-Model Energy & CO₂ Estimation"
-    )
+        description="DIANE -- per-model energy & CO2 estimation")
     parser.add_argument("--no-hf",     action="store_true",
-                        help="Skip HuggingFace lookup, use known values only")
+                        help="Skip HuggingFace lookup, use hardcoded values only")
     parser.add_argument("--no-export", action="store_true",
-                        help="Do not write results to S3")
+                        help="Skip writing results and plots to S3")
+    parser.add_argument("--hf-token",  default=None,
+                        help="HuggingFace API token (for gated models)")
     args, _ = parser.parse_known_args()
-    main(use_hf=not args.no_hf, export=not args.no_export)
+    main(use_hf=not args.no_hf, export=not args.no_export, hf_token=args.hf_token)
