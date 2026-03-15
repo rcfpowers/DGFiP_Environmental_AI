@@ -1,4 +1,4 @@
-iane_energy_analysis.py
+Diane_energy_analysis.py
 
 Estimates electricity consumption and CO2 emissions per LLM model on the
 DIANE platform (DGFiP / ENSAE), using PDU power measurements and LiteLLM
@@ -171,9 +171,7 @@ def get_fs():
         token=os.environ.get("AWS_SESSION_TOKEN"),
         client_kwargs={
             "endpoint_url": endpoint,
-            "region_name": os.environ.get("AWS_DEFAULT_REGION", "us-east-1"),
-        },
-    )
+            "region_name": os.environ.get("AWS_DEFAULT_REGION", "us-east-1"),},)
 
 def s3_path(*parts):
     """Build a full S3 path under the working prefix resolved at runtime."""
@@ -208,7 +206,7 @@ def list_data_files(fs):
         for p in root_items]
     print(f"  Bucket root entries: {root_entries}")
 
-    # ── Case A: no subfolder (Groupe Genes, files at bucket root) ────────────
+    # ── Case A: no subfolder (Groupe Genes, files at bucket root)
     if not S3_SUBFOLDER.strip():
         csv_files = [e for e in root_entries if e.endswith(".csv")]
         print(f"  No subfolder configured -- using bucket root ({len(csv_files)} CSVs found)")
@@ -218,7 +216,7 @@ def list_data_files(fs):
             print(f"    - {repr(fname)}")
         return result
 
-    # ── Case B: files inside a subfolder (SSPCloud) ───────────────────────────
+    # ── Case B: files inside a subfolder (SSPCloud) 
     # Match subfolder by stripped name (tolerates trailing space in MinIO)
     subfolder_match = next(
         (e for e in root_entries if e.strip().lower() == S3_SUBFOLDER.strip().lower()),
@@ -237,8 +235,7 @@ def list_data_files(fs):
         return {}
 
     folder_prefix = folder_path.rstrip("/") + "/"
-    result = {
-        p[len(folder_prefix):].strip(): p
+    result = {p[len(folder_prefix):].strip(): p
         for p in items
         if p[len(folder_prefix):].strip()}
 
@@ -274,8 +271,7 @@ def _check_credentials():
         fs_test = s3fs.S3FileSystem(
             key=key, secret=secret, token=token or None,
             client_kwargs={"endpoint_url": ep,
-                           "region_name": os.environ.get("AWS_DEFAULT_REGION", "us-east-1")},
-        )
+                           "region_name": os.environ.get("AWS_DEFAULT_REGION", "us-east-1")},)
         fs_test.ls(S3_BUCKET)
         print("  S3 connectivity     : OK")
     except Exception as e:
@@ -431,8 +427,7 @@ def _auto_dt(df, source_name):
                 df = df.rename(columns={c: "Datetime"})
             df["Datetime"] = pd.to_datetime(df["Datetime"], utc=True, errors="coerce")
             return df
-    raise ValueError(
-        f"No datetime column in {source_name}. Columns: {list(df.columns)}")
+    raise ValueError(f"No datetime column in {source_name}. Columns: {list(df.columns)}")
 
 def load_energy_dec(fs, bucket, filename, local=False):
     """
@@ -748,10 +743,8 @@ def build_params_map(models, use_hf=True, hf_token=None):
     params_map, excluded = {}, []
     for model in sorted(models):
         hf_repo = MODEL_HF_REPO.get(model)
-        hf_data = (
-            fetch_hf_info(model, hf_repo, token=hf_token)
-            if use_hf and hf_repo else {}
-        )
+        hf_data = (fetch_hf_info(model, hf_repo, token=hf_token)
+            if use_hf and hf_repo else {})
         params_B = hf_data.get("params_B")
         if params_B is None and model in MODEL_PARAMS_B_KNOWN:
             params_B = MODEL_PARAMS_B_KNOWN[model]
@@ -769,8 +762,7 @@ def build_params_map(models, use_hf=True, hf_token=None):
                 and hf_data.get("n_experts")
                 and hf_data.get("top_k")):
             f_moe = 0.85
-            eff = round(
-                (1 - f_moe) * params_B
+            eff = round((1 - f_moe) * params_B
                 + (hf_data["top_k"] / hf_data["n_experts"]) * f_moe * params_B,
                 3)
             MODEL_ACTIVE_PARAMS_B[model] = eff
@@ -813,8 +805,7 @@ def compute(usage, df_dec, df_feb_raw, df_feb_energy_wh, params_map, excluded):
     Returns (agg_df, energy_info_dict).
     """
     # Dec cluster power from PDU snapshot
-    gpu_col = next(
-        (c for c in df_dec.columns
+    gpu_col = next((c for c in df_dec.columns
          if c in ("GPU", "NODE", "PDU")
          or (df_dec[c].dtype == object and c != "Datetime")),
         None)
@@ -889,8 +880,7 @@ def compute(usage, df_dec, df_feb_raw, df_feb_energy_wh, params_map, excluded):
         total_requests=("Requests",     "sum"),
         total_tokens  =("Total Tokens", "sum"),
         total_spend   =("Spend ($)",    "sum"),
-        active_days   =("Date",         "nunique"),
-    ).reset_index()
+        active_days   =("Date",         "nunique"),).reset_index()
 
     agg["params_B"]      = agg["Model"].map(params_map)
     agg["dtype"]         = agg["Model"].map(MODEL_DTYPE).fillna("bf16")
@@ -915,9 +905,7 @@ def compute(usage, df_dec, df_feb_raw, df_feb_energy_wh, params_map, excluded):
     for sc in ("optimistic", "central", "pessimistic"):
         agg.loc[known, f"energy_fac_kWh_{sc}"] = (
             agg.loc[known, "share"] * energy_fac_total[sc])
-        agg.loc[known, f"co2_kg_{sc}"] = (
-            agg.loc[known, f"energy_fac_kWh_{sc}"] * CO2_FACTOR
-        )
+        agg.loc[known, f"co2_kg_{sc}"] = (agg.loc[known, f"energy_fac_kWh_{sc}"] * CO2_FACTOR)
 
     agg.loc[known, "energy_fac_kWh"] = agg.loc[known, "energy_fac_kWh_central"]
     agg.loc[known, "co2_kg"]         = agg.loc[known, "co2_kg_central"]
@@ -935,8 +923,7 @@ def compute(usage, df_dec, df_feb_raw, df_feb_energy_wh, params_map, excluded):
 
     for period_label, period_df, period_fac in [
         ("dec", usage[usage["Date"] <= "2025-12-31"], fac_dec),
-        ("feb", usage_feb, fac_feb),
-    ]:
+        ("feb", usage_feb, fac_feb),]:
         p = period_df.groupby("Model").agg(
             tokens=(    "Total Tokens", "sum"),
             requests=(  "Requests",     "sum"),
@@ -945,12 +932,10 @@ def compute(usage, df_dec, df_feb_raw, df_feb_energy_wh, params_map, excluded):
         shares = _attribution_share(p, params_map)
         agg[f"energy_{period_label}_kWh"] = agg["Model"].map(shares) * period_fac
         agg[f"co2_{period_label}_kg"]     = (
-            agg[f"energy_{period_label}_kWh"] * CO2_FACTOR
-        )
+            agg[f"energy_{period_label}_kWh"] * CO2_FACTOR)
 
     agg = agg.sort_values(
-        "energy_fac_kWh", ascending=False, na_position="last"
-    ).reset_index(drop=True)
+        "energy_fac_kWh", ascending=False, na_position="last").reset_index(drop=True)
 
     print("\n  Attribution corrections applied:")
     print(f"    FP8 models       : {agg.loc[agg['dtype']=='fp8', 'Model'].tolist()}")
@@ -978,8 +963,7 @@ def compute_feb_only(usage, df_feb_energy_wh, cluster_power_dec_w, params_map):
     Returns a DataFrame (or empty DataFrame if no Feb usage data).
     """
     usage_feb = usage[
-        (usage["Date"] >= "2026-02-01") & (usage["Date"] <= "2026-02-28")
-    ].copy()
+        (usage["Date"] >= "2026-02-01") & (usage["Date"] <= "2026-02-28")].copy()
 
     if len(usage_feb) == 0:
         print("  [WARN] No February usage data found")
@@ -1008,8 +992,7 @@ def compute_feb_only(usage, df_feb_energy_wh, cluster_power_dec_w, params_map):
     agg = usage_feb.groupby("Model").agg(
         total_requests=("Requests",     "sum"),
         total_tokens  =("Total Tokens", "sum"),
-        active_days   =("Date",         "nunique"),
-    ).reset_index()
+        active_days   =("Date",         "nunique"),).reset_index()
 
     agg["params_B"]        = agg["Model"].map(params_map)
     agg["dtype"]           = agg["Model"].map(MODEL_DTYPE).fillna("bf16")
@@ -1156,8 +1139,7 @@ def plot_power_feb(df_feb, fs=None, bucket=None):
         for d in pd.date_range(
             hourly.index[0].normalize(),
             hourly.index[-1].normalize() + pd.Timedelta(days=1),
-            freq="D"
-        ):
+            freq="D"):
             if d.weekday() >= 5:
                 ax.axvspan(d, d + pd.Timedelta(days=1),
                            color=C_GRID, alpha=0.5, zorder=0)
@@ -1201,8 +1183,7 @@ def plot_energy_by_model(agg, fs=None, bucket=None):
         (axes[0, 0], "energy_fac_kWh", "kWh (facility)", "Total facility energy", "{:,.0f}"),
         (axes[0, 1], "co2_kg",         "kg CO2e",        "Carbon footprint",       "{:,.1f}"),
         (axes[1, 0], "kWh_per_1M_tok", "kWh / M tokens", "Efficiency (↓ = better)","{:,.2f}"),
-        (axes[1, 1], "gCO2_per_req",   "g CO2e / req",   "CO2 per request",        "{:,.3f}"),
-    ]:
+        (axes[1, 1], "gCO2_per_req",   "g CO2e / req",   "CO2 per request",        "{:,.3f}"),]:
         sub  = df.dropna(subset=[col])
         vals = sub[col].values
         bars = ax.barh(
@@ -1408,8 +1389,7 @@ def plot_results_table(agg, energy_info, fs=None, bucket=None):
             f"{r['co2_kg']:,.0f}",
             f"{r['kWh_per_1M_tok']:.2f}",
             f"{r['Wh_per_req']:.2f}",
-            f"{r['gCO2_per_req']:.3f}",
-        ])
+            f"{r['gCO2_per_req']:.3f}",])
 
     ei      = energy_info
     tot_fac = ei["energy_fac_total_central"]
@@ -1578,7 +1558,7 @@ def plot_donut_energy(agg, energy_info, fs=None, bucket=None):
     has_dec = ei.get("n_days_dec_opt", 0) > 0
     period  = "1--24 Feb 2026" if not has_dec else "Oct 2025 -- Feb 2026"
 
-    # ── Figure layout ─────────────────────────────────────────────────────────
+    # ── Figure layout 
     # Leave the top 12% of the figure for the suptitle (y goes 0..1 bottom-up).
     # Axes start at y=0.05 and end at y=0.88 to give the title room above.
     TOP    = 0.88
@@ -1590,7 +1570,7 @@ def plot_donut_energy(agg, energy_info, fs=None, bucket=None):
         fontsize=11, fontweight="bold",
         x=0.5, y=0.97, ha="center",)
 
-    # ── Left panel: donut ─────────────────────────────────────────────────────
+    # ── Left panel: donut 
     ax_donut = fig.add_axes([0.01, BOTTOM, 0.52, TOP - BOTTOM])
     ax_donut.set_title("A   Facility energy share per model",
                        fontsize=10, fontweight="bold", loc="left", pad=6)
@@ -1607,7 +1587,7 @@ def plot_donut_energy(agg, energy_info, fs=None, bucket=None):
         bbox_to_anchor=(-0.18, -0.12), frameon=True,
         title="Model", title_fontsize=9,)
 
-    # ── Right panel: KPI cards ────────────────────────────────────────────────
+    # ── Right panel: KPI cards 
     ax_kpi = fig.add_axes([0.56, BOTTOM, 0.42, TOP - BOTTOM])
     ax_kpi.axis("off")
     ax_kpi.set_title("B   Facility energy breakdown",
@@ -1694,8 +1674,7 @@ def print_summary(agg, energy_info):
          agg["co2_kg_pessimistic"].sum(), "{:>13,.1f}"),
         ("Equiv. car distance (km)",
          agg["co2_kg_optimistic"].sum() / 0.12, agg["co2_kg"].sum() / 0.12,
-         agg["co2_kg_pessimistic"].sum() / 0.12, "{:>13,.0f}"),
-    ]:
+         agg["co2_kg_pessimistic"].sum() / 0.12, "{:>13,.0f}"),]:
         print(f"  {label:<34s} {fmt.format(opt)} {fmt.format(cen)} {fmt.format(pes)}")
 
     print("-" * 78)
@@ -1713,13 +1692,13 @@ def main(use_hf=True, export=True, hf_token=None):
     sep = "=" * 60
     print(sep); print("DIANE Energy Analysis (Onyxia / S3)"); print(sep)
 
-    # ── [0] Credentials and S3 connection ────────────────────────────────────
+    # ── [0] Credentials and S3 connection 
     print("\n[0/7] Connecting to S3...")
     _check_credentials()
     fs = get_fs()
     print(f"  s3://{S3_BUCKET}  |  endpoint: {os.environ.get('S3_ENDPOINT', '?')}")
 
-    # ── [1] Load all data ─────────────────────────────────────────────────────
+    # ── [1] Load all data 
     print(f"\n[1/7] Loading data from s3://{S3_BUCKET}/{S3_SUBFOLDER.strip()} ...")
     available   = list_data_files(fs)
     local_files = {}
@@ -1741,8 +1720,7 @@ def main(use_hf=True, export=True, hf_token=None):
                      else next(
                          (s3_path(k) for k in available
                           if fname.lower().replace(" ", "") in k.lower().replace(" ", "")),
-                         None
-                     ))
+                         None))
             if fpath:
                 try:
                     with fs.open(fpath) as fh:
@@ -1785,7 +1763,7 @@ def main(use_hf=True, export=True, hf_token=None):
         df_feb_raw, df_feb_energy_wh, _ = load_energy_feb(
             fs, "", s3_path(ENERGY_FILE_FEB))
 
-    # ── [1b] PDU circuit files → unified dataset ──────────────────────────────
+    # ── [1b] PDU circuit files → unified dataset 
     print("\n[1b/7] Loading PDU circuit files & building unified dataset...")
     if local_files:
         df_pdu = _load_pdu_files_local(local_files)
@@ -1798,14 +1776,14 @@ def main(use_hf=True, export=True, hf_token=None):
     unified = build_unified_dataset(fs, S3_BUCKET, usage, df_pdu)
     print(f"  Unified dataset: {len(unified):,} rows | {len(unified.columns)} cols")
 
-    # ── [2] Model parameters ──────────────────────────────────────────────────
+    # ── [2] Model parameters
     mode_str = "HF+fallback" if use_hf else "fallback only"
     print(f"\n[2/7] Resolving model parameters ({mode_str})...")
     params_map, excluded = build_params_map(
         sorted(usage["Model"].unique()), use_hf=use_hf, hf_token=hf_token)
     print(f"  Resolved: {len(params_map)} | Excluded: {len(excluded)}")
 
-    # ── [3] Energy and CO2 computation (February only) ───────────────────────
+    # ── [3] Energy and CO2 computation (February only) 
     print("\n[3/7] Computing Feb energy & CO2...")
     agg_feb = compute_feb_only(
         usage, df_feb_energy_wh,
@@ -1844,11 +1822,11 @@ def main(use_hf=True, export=True, hf_token=None):
         agg[f"energy_fac_kWh_{sc}"] = agg["energy_fac_kWh"]
     energy_info = ei
 
-    # ── [4] Summary ───────────────────────────────────────────────────────────
+    # ── [4] Summary
     print("\n[4/7] Summary...")
     print_summary(agg, energy_info)
 
-    # ── [5] Plots ─────────────────────────────────────────────────────────────
+    # ── [5] Plots 
     print("\n[5/7] Generating 3 charts (10, 11, 12)...")
     bucket_out = S3_BUCKET if export else None
     # Plots 1-9 are available as standalone functions but not generated by default.
@@ -1865,7 +1843,7 @@ def main(use_hf=True, export=True, hf_token=None):
     plot_corrections_table(agg, fs, bucket_out)
     plot_donut_energy(agg, _ei_feb, fs, bucket_out)
 
-    # ── [6] Export ────────────────────────────────────────────────────────────
+    # ── [6] Export
     if export:
         print("\n[6/7] Exporting to S3...")
         with fs.open(f"{S3_BUCKET}/{OUTPUT_CSV}", "w") as f:
