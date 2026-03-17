@@ -36,9 +36,9 @@ os.environ["AWS_DEFAULT_REGION"] = 'us-east-1'
 
 fs = s3fs.S3FileSystem(
     client_kwargs={'endpoint_url': 'https://'+'minio-simple.lab.groupe-genes.fr'},
-    key = os.environ["AWS_ACCESS_KEY_ID"],
-    secret = os.environ["AWS_SECRET_ACCESS_KEY"],
-    token = os.environ["AWS_SESSION_TOKEN"])
+    key=os.environ["AWS_ACCESS_KEY_ID"],
+    secret=os.environ["AWS_SECRET_ACCESS_KEY"],
+    token=os.environ["AWS_SESSION_TOKEN"])
 
 # List of models matching DGFiP's data to HuggingFace ID
 MODEL_HF_REPO = {
@@ -53,7 +53,7 @@ MODEL_HF_REPO = {
     "dgfip-e5-large": "intfloat/e5-large",
 }
 
-# List of models whose parameters are not retievable from HuggingFace API 
+# List of models whose parameters are not retievable from HuggingFace API
 MODEL_PARAMS_B_KNOWN = {
     "Llama-3-3-70B-128k": 70.0,
     "Mistral-Small-24B-Instruct-2501-FP8-dynamic": 24.0,
@@ -63,59 +63,60 @@ MODEL_PARAMS_B_KNOWN = {
 }
 
 
-def fetch_rte_co2_factor(start_date, end_date, fallback_gco2_per_kwh=35.0):
+def fetch_rte_co2_factor(start_date, end_date, fallback_gco2_per_kwh=17.0):
     """
-    Fetch 15-minute interval CO2 emission factors (gCO2/kWh) from the RTE éCO2mix
-    real-time zip file.
-
+    Fetch 15-minute interval CO2 emission factors (gCO2/kWh) from RTE.
     Source: https://eco2mix.rte-france.com/download/eco2mix/eCO2mix_RTE_En-cours-TR.zip
 
-    Returns 15-minute interval data for merging with energy readings via
-    backward merge (last overlapping 15-min interval per 5-min energy reading).
+    For historical data, please use the following source:
+    Source: https://eco2mix.rte-france.com/download/eco2mix/eCO2mix_RTE_En-cours-Consolide.zip
 
-    Falls back to a hardcoded French grid average if the download fails.
+    Returns interval data
+    Uses hardcoded French grid average if the download fails.
 
     Parameters
     ----------
-    start_date           : str, format 'YYYY-MM-DD'
-    end_date             : str, format 'YYYY-MM-DD'
-    fallback_gco2_per_kwh: float, fallback value in gCO2eq/kWh (default 35.0)
+    start_date : str, format 'YYYY-MM-DD'
+    end_date : str, format 'YYYY-MM-DD'
+    fallback_gco2_per_kwh: float, gCO2eq/kWh
 
     Returns
     -------
     co2_df : DataFrame with columns [datetime, co2_g_per_kwh, co2_source]
     """
-    ZIP_URL  = "https://eco2mix.rte-france.com/download/eco2mix/eCO2mix_RTE_En-cours-TR.zip"
+    ZIP_URL = "https://eco2mix.rte-france.com/download/eco2mix/eCO2mix_RTE_En-cours-TR.zip"
     XLS_NAME = "eCO2mix_RTE_En-cours-TR.xls"
 
     try:
-        print(f"  [CO2]  Downloading RTE éCO2mix zip...")
+        print("  [CO2]  Downloading RTE éCO2mix zip...")
         response = requests.get(ZIP_URL, timeout=30)
         response.raise_for_status()
 
+        # Reading zipfile with French structure, requires additional encoding steps
         with zipfile.ZipFile(io.BytesIO(response.content)) as z:
             with z.open(XLS_NAME) as xls_file:
                 raw_bytes = xls_file.read()
 
-        # Two-step read to handle trailing tab on data rows (41 fields vs 40 in header)
-        cols = pd.read_csv(io.BytesIO(raw_bytes), sep="\t", encoding="latin-1", nrows=0).columns.tolist()
+        # trailing tab on rows
+        cols = pd.read_csv(io.BytesIO(raw_bytes),
+                           sep="\t", encoding="latin-1", nrows=0).columns.tolist()
         cols_with_extra = cols + ["_extra"]
         df = pd.read_csv(io.BytesIO(raw_bytes), sep="\t", encoding="latin-1",
                          low_memory=False, names=cols_with_extra, skiprows=1)
         df = df.drop(columns=["_extra"], errors="ignore")
 
-        # Identify relevant columns
-        co2_col  = next((c for c in df.columns if "co2" in str(c).lower()), None)
+        # build dataframe with co2 and datetime intervals
+        co2_col = next((c for c in df.columns if "co2" in str(c).lower()), None)
         date_col = next((c for c in df.columns if str(c).strip().lower() == "date"), None)
-        time_col = next((c for c in df.columns if str(c).strip().lower() in ["heures", "heure"]), None)
+        t_col = next((c for c in df.columns if str(c).strip().lower() in ["heures", "heure"]), None)
 
         if not co2_col or not date_col:
             raise ValueError(f"Could not identify required columns. Found: {list(df.columns)}")
 
-        # Parse datetime
-        if time_col:
+        # Parse datetime where multiple datatypes are present
+        if t_col:
             df["datetime"] = pd.to_datetime(
-                df[date_col].astype(str) + " " + df[time_col].astype(str),
+                df[date_col].astype(str) + " " + df[t_col].astype(str),
                 format="%Y-%m-%d %H:%M",
                 errors="coerce"
             )
@@ -127,7 +128,7 @@ def fetch_rte_co2_factor(start_date, end_date, fallback_gco2_per_kwh=35.0):
 
         # Filter to requested date range
         start = pd.Timestamp(start_date)
-        end   = pd.Timestamp(end_date)
+        end = pd.Timestamp(end_date)
         df = df[(df["datetime"] >= start) & (df["datetime"] <= end)]
 
         if df.empty:
@@ -146,7 +147,7 @@ def fetch_rte_co2_factor(start_date, end_date, fallback_gco2_per_kwh=35.0):
         return co2_df
 
     except Exception as e:
-        print(f"  [CO2]  RTE zip unavailable ({e}) — using fallback {fallback_gco2_per_kwh} gCO2/kWh")
+        print(f"  [CO2]  RTE zip unavailable ({e}) — using {fallback_gco2_per_kwh} gCO2/kWh")
         # Generate fallback at 15-min intervals
         datetimes = pd.date_range(start=start_date, end=end_date, freq="15min")
         return pd.DataFrame({
@@ -158,7 +159,19 @@ def fetch_rte_co2_factor(start_date, end_date, fallback_gco2_per_kwh=35.0):
 
 def load_usage(fs, bucket, files):
     """
-    Make function comments
+    Pulls then reformats model usage data from the S3 bucket
+    TODO: need to change to the data sources locations for DGFiP
+
+    Parameters
+    ----------
+    fs : S3FileSystem
+    bucket : str, location of files
+    files: list of str, name of each csv file
+
+    Returns
+    -------
+    usage : DataFrame with columns [Date, Team_ID, Model, Spend, Requests, Successful, Failed,
+                                    Total_tokens]
     """
     dfs = []
     for f in files:
@@ -171,12 +184,28 @@ def load_usage(fs, bucket, files):
     usage["Total_tokens"] = pd.to_numeric(usage["Total Tokens"], errors="coerce").fillna(0)
     usage["Requests"] = pd.to_numeric(usage["Requests"], errors="coerce").fillna(0)
     usage["Spend"] = pd.to_numeric(usage["Spend ($)"], errors="coerce").fillna(0)
+    usage["Team_ID"] = usage["Team ID"]
+    usage.drop(columns=['Team', 'Spend ($)', 'Total Tokens', 'Team ID'], inplace=True)
     return usage
 
 
 def load_energy(fs, bucket):
     """
-    Make function comments
+    Pulls then reformats data center energy data from the S3 bucket
+
+    Will pull all csv files with the naming convention
+    [3_Digit_Number]_[Letter][Digit]_[Voie]_[YYYYMMDD]
+
+    TODO: need to change to the data sources locations for DGFiP
+
+    Parameters
+    ----------
+    fs : S3FileSystem
+    bucket : str, location of files
+
+    Returns
+    -------
+    usage : DataFrame with columns [source_file, Datetime, ID_Voie, energy_used]
     """
     pattern = re.compile(r"^\d{3}_[A-Za-z]\d+_Voie\d+_\d{8}\.csv$")
     all_files = fs.ls(bucket)
@@ -200,11 +229,13 @@ def load_energy(fs, bucket):
     df = df.sort_values(["source_file", "timestamp"])
     df["Datetime"] = pd.to_datetime(df["timestamp"], utc=True)
     df = df.dropna()
-    df["ID_Voie"] = df["source_file"].str.replace(".csv", "", regex=False).str.rsplit("_", n=1).str[0]
+    df["ID_Voie"] = df["source_file"].str.replace(".csv", "",
+                                                  regex=False).str.rsplit("_", n=1).str[0]
     df = df.sort_values(["ID_Voie", "Datetime"]).reset_index(drop=True)
-
     df['energy_used'] = df.groupby('ID_Voie')['Input Cumulated Energy Total (Wh)'].diff(periods=2)
+    df = df[['source_file', 'Datetime', 'ID_Voie', 'energy_used']]
 
+    # Move to final visualization part that Margot recommended
     for id_val, group in df.groupby("ID_Voie"):
         plt.plot(group["Datetime"], group["energy_used"], label=id_val)
 
@@ -223,7 +254,20 @@ def load_energy(fs, bucket):
 
 def fetch_hf_params(model_name, hf_repo):
     """
-    Make comments
+    Pulls the number of parameters for a model from HuggingFace API, with a fallback
+    of desk research on the number of parameters that is hard coded in the MODEL_PARAMS_B_KNOWN
+    mapping
+
+    Relies on the HuggingFace safe model names as stored in the MODEL_HF_REPO mapping
+
+    Parameters
+    ----------
+    model_name : name of model following HuggingFace naming convention
+    hf_repo : dict, mapping the model to hardcoded parameter numbers
+
+    Returns
+    -------
+    p : number of model's parameters
     """
     try:
         info = HfApi().model_info(hf_repo)
@@ -245,7 +289,22 @@ def fetch_hf_params(model_name, hf_repo):
 
 def build_params_map(models):
     """
-    Make comments
+    Calls the fetch_hf_params for each model and organizes the results into different
+    data structures depending on if parameter counts are found. Communicates these
+    results to the user via terminal output.
+
+    Relies on the HuggingFace safe model names as stored in the MODEL_HF_REPO mapping
+    and desk research in MODEL_PARAMS_B_KNOWN if the parameters are not in HuggingFace
+
+    Parameters
+    ----------
+    models : list of str, which represent the DGFiP deployed models following internal naming
+             conventions
+
+    Returns
+    -------
+    params_map : dict representing the models with known parameter counts
+    excluded : list of models with no known parameter counts
     """
     params_map = {}
     excluded = []
@@ -269,9 +328,7 @@ def build_params_map(models):
 
 def estimate_idle_energy(energy_df, idle_quantile=0.05, idle_window_days=7):
     """
-    Estimate idle/baseline energy consumption per Voie.
-    Currently disabled — returns None until model run timestamps are available
-    to properly isolate idle from active periods.
+    Estimate idle energy consumption per voie.
 
     TODO: enable this function when any of the following become available:
         - Model run start/end timestamps to mask active periods before computing baseline
@@ -280,20 +337,20 @@ def estimate_idle_energy(energy_df, idle_quantile=0.05, idle_window_days=7):
 
     Current limitation: servers run continuously at consistent load, so the lower
     quantile of energy_used is not meaningfully different from the median — leading
-    to ~99% of energy being incorrectly classified as idle.
+    to ~99% of energy being classified as idle.
 
     Parameters
     ----------
-    energy_df        : energy dataframe with Datetime, ID_Voie, energy_used columns
-    idle_quantile    : lower quantile of energy_used to use as idle estimate (default 5th percentile)
-    idle_window_days : number of days to use for rolling idle baseline (default 7)
+    energy_df : energy df with [Datetime, ID_Voie, energy_used] columns
+    idle_quantile : lower quantile of energy_used to use as idle estimate
+    idle_window_days : number of days to use for rolling idle baseline
 
     Returns
     -------
     None until data quality allows reliable idle detection
     """
-    print("  [idle] Idle estimation disabled — model run timestamps required for reliable baseline.")
-    print("  [idle] TODO: provide model run start/end times to isolate idle from active consumption.")
+    print("  [idle] Idle estimation disabled — model run timestamps required for baseline.")
+    print("  [idle] TODO: provide model run start/end times to isolate idle from active use.")
     return None
 
 
@@ -303,12 +360,12 @@ def compute_peak_analysis(energy_df):
 
     Parameters
     ----------
-    energy_df : energy dataframe with Datetime, ID_Voie, energy_used columns
+    energy_df : energy dataframe with [Datetime, ID_Voie, energy_used] columns
 
     Returns
     -------
-    monthly_peaks : DataFrame with ID_Voie, month, peak_energy_wh
-    top5_peaks    : DataFrame with ID_Voie, Datetime, peak_energy_wh for top 5 peaks
+    monthly_peaks : df with [ID_Voie, month, peak_energy_wh]
+    top5_peaks    : df with [ID_Voie, Datetime, peak_energy_wh for top 5 peaks]
     """
     energy_df = energy_df.copy()
     energy_df["month"] = energy_df["Datetime"].dt.to_period("M")
@@ -336,12 +393,12 @@ def aggregate_energy_daily(energy_df):
 
     Parameters
     ----------
-    energy_df : energy dataframe with Datetime, ID_Voie, energy_used columns
+    energy_df : energy df with [Datetime, ID_Voie, energy_used] columns
 
     Returns
     -------
-    energy_daily : DataFrame with date, total_energy_wh
-    energy_df    : filtered and date-annotated energy dataframe
+    energy_daily : df with [date, total_energy_wh]
+    energy_df : filtered and date-annotated energy df
     """
     energy_df = energy_df.copy()
     energy_df["date"] = energy_df["Datetime"].dt.tz_localize(None).dt.normalize()
@@ -364,26 +421,27 @@ def apply_idle_subtraction(energy_daily, energy_df):
 
     Parameters
     ----------
-    energy_daily : daily aggregated energy DataFrame
-    energy_df    : interval-level energy DataFrame
+    energy_daily : daily aggregated energy df
+    energy_df    : interval-level energy df
 
     Returns
     -------
-    energy_daily : DataFrame with idle_energy_wh and active_energy_wh columns added
+    energy_daily : original df with [idle_energy_wh, active_energy_wh] columns added
     """
     idle_df = estimate_idle_energy(energy_df)
     if idle_df is not None:
-        idle_daily = idle_df.groupby("date").agg(idle_energy_wh=("idle_energy_wh", "sum")).reset_index()
+        idle_daily = idle_df.groupby("date").agg(idle_energy_wh=("idle_energy_wh",
+                                                                 "sum")).reset_index()
         energy_daily = energy_daily.merge(idle_daily, on="date", how="left")
         energy_daily["idle_energy_wh"] = energy_daily["idle_energy_wh"].fillna(0)
         energy_daily["active_energy_wh"] = (
             energy_daily["total_energy_wh"] - energy_daily["idle_energy_wh"]
         ).clip(lower=0)
-        print("  [idle] Idle energy subtracted from total — using active_energy_wh for token estimate.")
+        print("  [idle] Idle energy subtracted from total — using active_energy_wh for estimate.")
     else:
         energy_daily["idle_energy_wh"] = None
         energy_daily["active_energy_wh"] = energy_daily["total_energy_wh"]
-        print("  [idle] Using total_energy_wh as proxy — estimate includes idle consumption (upper bound).")
+        print("  [idle] Using total_energy_wh as proxy — includes idle consumption (upper bound).")
 
     return energy_daily
 
@@ -395,15 +453,15 @@ def apply_co2_factors(energy_daily, energy_df):
 
     Parameters
     ----------
-    energy_daily : daily aggregated energy DataFrame
-    energy_df    : interval-level energy DataFrame with Datetime column
+    energy_daily : daily aggregated energy df
+    energy_df    : interval-level energy df with Datetime column
 
     Returns
     -------
-    energy_daily : DataFrame with co2_g_per_kwh, co2_source, co2_kg columns added
+    energy_daily : original df with [co2_g_per_kwh, co2_source, co2_kg columns] added
     """
-    start  = (energy_daily["date"].min() + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
-    end    = energy_df["Datetime"].dt.tz_localize(None).max().strftime("%Y-%m-%d")
+    start = (energy_daily["date"].min() + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+    end = energy_df["Datetime"].dt.tz_localize(None).max().strftime("%Y-%m-%d")
     co2_df = fetch_rte_co2_factor(start, end)
 
     # Match each 5-min energy reading to the last overlapping 15-min CO2 interval
@@ -429,24 +487,25 @@ def apply_co2_factors(energy_daily, energy_df):
     )
 
     energy_daily = energy_daily.merge(co2_daily, on="date", how="left")
-    energy_daily["co2_kg"] = (energy_daily["active_energy_wh"] / 1000) * (energy_daily["co2_g_per_kwh"] / 1000)
+    energy_daily["co2_kg"] = (
+        (energy_daily["active_energy_wh"] / 1000) * (energy_daily["co2_g_per_kwh"] / 1000)
+    )
 
     return energy_daily
 
 
 def build_energy_daily(energy_df):
     """
-    Full pipeline to produce a daily energy DataFrame with idle subtraction
-    and CO2 factors attached.
+    Produce  daily energy df with idle subtraction and CO2 factors attached.
 
     Parameters
     ----------
-    energy_df : raw interval-level energy DataFrame
+    energy_df : raw interval-level energy df
 
     Returns
     -------
-    energy_daily : DataFrame with date, total_energy_wh, idle_energy_wh,
-                   active_energy_wh, co2_g_per_kwh, co2_source, co2_kg
+    energy_daily : df with [date, total_energy_wh, idle_energy_wh,
+                   active_energy_wh, co2_g_per_kwh, co2_source, co2_kg]
     """
     energy_daily, energy_df_filtered = aggregate_energy_daily(energy_df)
     energy_daily = apply_idle_subtraction(energy_daily, energy_df_filtered)
@@ -461,20 +520,20 @@ def merge_usage_and_energy(usage_df, energy_daily):
 
     Parameters
     ----------
-    usage_df     : usage DataFrame with Date, Model, Total Tokens columns
-    energy_daily : daily energy DataFrame from build_energy_daily
+    usage_df     : usage df with [Date, Model, Total_tokens] columns
+    energy_daily : daily energy df from build_energy_daily
 
     Returns
     -------
-    merged : usage_df joined with energy_daily with wh_per_1000_tokens
-             and co2_g_per_1000_tokens columns added
+    merged : usage_df joined with energy_daily with [wh_per_1000_tokens,
+             co2_g_per_1000_tokens] columns added
     """
     usage_df = usage_df.copy()
     usage_df["date"] = pd.to_datetime(usage_df["Date"]).dt.normalize()
 
     merged = usage_df.merge(energy_daily, on="date", how="left")
-    merged["wh_per_1000_tokens"]    = (merged["active_energy_wh"] / merged["Total Tokens"]) * 1000
-    merged["co2_g_per_1000_tokens"] = (merged["co2_kg"] * 1000 / merged["Total Tokens"]) * 1000
+    merged["wh_per_1000_tokens"] = (merged["active_energy_wh"] / merged["Total_tokens"]) * 1000
+    merged["co2_g_per_1000_tokens"] = (merged["co2_kg"] * 1000 / merged["Total_tokens"]) * 1000
 
     return merged
 
@@ -482,8 +541,7 @@ def merge_usage_and_energy(usage_df, energy_daily):
 def estimate_wh_per_1000_tokens(merged_df):
     """
     Estimate Wh per 1000 tokens for the clean anchor model window.
-    Currently filtered to single-model days for gte-Qwen2-1-5B-instruct.
-    TODO: expand as data quality improves.
+    TODO: expand with access to more granular data
 
     Parameters
     ----------
@@ -492,7 +550,7 @@ def estimate_wh_per_1000_tokens(merged_df):
     Returns
     -------
     overall_estimate : float, Wh per 1000 tokens for the anchor model
-    clean            : DataFrame filtered to the clean estimation window
+    clean            : df filtered to the clean estimation window
     """
     # TODO: remove this filter as more clean single-model days are identified
     clean_dates = pd.to_datetime(["2026-02-01", "2026-02-02"])
@@ -503,7 +561,7 @@ def estimate_wh_per_1000_tokens(merged_df):
         (merged_df["Model"] == clean_model)
     ]
 
-    overall_estimate = (clean["active_energy_wh"].sum() / clean["Total Tokens"].sum()) * 1000
+    overall_estimate = (clean["active_energy_wh"].sum() / clean["Total_tokens"].sum()) * 1000
 
     return overall_estimate, clean
 
@@ -512,33 +570,29 @@ def main():
     df_usage = load_usage(fs, S3_BUCKET, USAGE_FILES)
     df_energy = load_energy(fs, S3_BUCKET)
 
-    # --- Build daily energy with idle subtraction and CO2 ---
     print("\n[1] Building daily energy and CO2 factors...")
     energy_daily = build_energy_daily(df_energy)
 
-    # --- Merge usage and energy ---
     print("\n[2] Merging usage and energy data...")
     merged_df = merge_usage_and_energy(df_usage, energy_daily)
 
-    # --- Estimate Wh per 1000 tokens ---
     print("\n[3] Estimating Wh per 1000 tokens...")
     wh_per_1000, clean = estimate_wh_per_1000_tokens(merged_df)
 
-    total_tokens         = clean["Total Tokens"].sum()
-    total_energy         = clean["active_energy_wh"].sum()
-    total_co2_kg         = clean["co2_kg"].sum()
+    total_tokens = clean["Total_tokens"].sum()
+    total_energy = clean["active_energy_wh"].sum()
+    total_co2_kg = clean["co2_kg"].sum()
     overall_co2_per_1000 = (total_co2_kg * 1000 / total_tokens) * 1000
 
-    print(clean[["date", "Model", "Total Tokens", "total_energy_wh", "active_energy_wh",
+    print(clean[["date", "Model", "Total_tokens", "total_energy_wh", "active_energy_wh",
                  "wh_per_1000_tokens", "co2_kg", "co2_g_per_1000_tokens"]])
-    print(f"\n  Model: gte-Qwen2-1-5B-instruct")
+    print("\n  Model: gte-Qwen2-1-5B-instruct")
     print(f"  Total Tokens:               {total_tokens:,}")
     print(f"  Total Energy (active):      {total_energy:,.1f} Wh")
     print(f"  Estimate:                   {wh_per_1000:.4f} Wh / 1000 tokens")
     print(f"  Total CO2:                  {total_co2_kg:.4f} kgCO2e")
     print(f"  CO2 Intensity:              {overall_co2_per_1000:.4f} gCO2e / 1000 tokens")
 
-    # --- Peak analysis ---
     print("\n[4] Peak analysis...")
     monthly_peaks, top5_peaks = compute_peak_analysis(df_energy)
     print("\n  Monthly peaks per Voie:")
@@ -546,7 +600,6 @@ def main():
     print("\n  Top 5 quarterly peaks:")
     print(top5_peaks.to_string(index=False))
 
-    # --- Model parameter lookup ---
     print("\n[5] Looking up model parameters (HuggingFace + fallback)...")
     models = sorted(df_usage["Model"].unique())
     params_map, excluded = build_params_map(models)
@@ -556,74 +609,3 @@ def main():
 
 
 merged_df, wh_per_1000, energy_daily, monthly_peaks, top5_peaks, params_map = main()
-
-ai_energy = pd.read_csv("https://raw.githubusercontent.com/Nidhal-Jegham/HowHungryisAIDashboard/main/output/artificialanalysis_environmental.csv")
-
-folder_path = "/home/onyxia/work/energy_score_data_02_26/*.csv"
-"""
-aie_models = []
-
-for file in glob.glob(folder_path):
-    m = pd.read_csv(file)
-
-    m["type"] = os.path.splitext(os.path.basename(file))[0]
-
-    aie_models.append(m)
-
-aie_models = pd.concat(aie_models, ignore_index=True)
-
-aie_models[['Company', 'model_name']] = aie_models['model'].str.split('/', expand=True)
-
-aie_models['variation'] = aie_models['model_name'].str.extract(r'\b(low|medium|high)\b')
-aie_models['variation'] = aie_models['variation'].fillna('medium')
-aie_models['base_model'] = aie_models['model_name'].str.replace(r'\s+(low|medium|high)\b', '', regex=True)
-
-metrics = ['total_gpu_energy', 'energy_score', 'test date']
-
-pivot_df = aie_models.pivot_table(
-    index='base_model',
-    columns='variation',
-    values=metrics,
-    aggfunc='first'
-)
-
-pivot_df.columns = [
-    f"{metric}" if var == "medium" else f"{metric}_{var}"
-    for metric, var in pivot_df.columns
-]
-
-pivot_df = pivot_df.reset_index()
-
-aie_models = aie_models.drop(columns=metrics + ['variation']).drop_duplicates('base_model') \
-    .merge(pivot_df, on='base_model', how='left')
-aie_models['model_name'] = aie_models['model_name'].str.replace(r'\smedium$', '', regex=True)
-
-
-
-df_usage.loc[df_usage['Model'] == "Llama-3-3-70B-128k", 'Task'] = 'Text_Generation'
-
-df_usage.loc[df_usage['Model'] == "gptoss120b", 'Task'] = 'Reasoning'
-
-df_usage.loc[df_usage['Model'] == "gptoss20b", 'Task'] = 'Reasoning'
-
-df_usage.loc[df_usage['Model'] == '/model/deepdml-faster-whisper-large-v3-turbo-ct2', 'Task'] = 'Automatic_Speech_Recognition'
-
-df_usage.loc[df_usage['Model'] == 'Qwen2.5-Coder-32B-Instruct-fp8-W8A16', 'Task'] = 'Text_Generation'
-
-df_usage.loc[df_usage['Model'] == 'gte-Qwen2-1-5B-instruct', 'Task'] = 'Sentence_Similarity'
-
-df_usage.loc[df_usage['Model'] == 'Mistral-Small-24B-Instruct-2501-FP8-dynamic', 'Task'] = 'Reasoning'
-
-df_usage.loc[df_usage['Model'] == 'dgfip-e5-large', 'Task'] = 'Sentence_Similarity'
-
-df_usage['AIE_name'] = df_usage['HF_URL'].str.split("/").str[-1]
-
-df_usage.loc[df_usage['AIE_name'] == 'e5-large', 'AIE_name'] = "e5-large-v2"
-
-
-#model_data = df_usage.merge(aie_models, left_on='AIE_name', right_on='model_name', how='left')
-
-print(models)
-
-print(df_usage.head())
-"""
