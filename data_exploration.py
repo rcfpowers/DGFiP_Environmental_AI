@@ -297,18 +297,56 @@ def estimate_idle_energy(energy_df, idle_quantile=0.05, idle_window_days=7):
     return None
 
 
-def estimate_wh_per_1000_tokens(energy_df, usage_df):
+def compute_peak_analysis(energy_df):
     """
-    Estimate Wh per 1000 tokens for all models on all days.
-    Currently filtered to clean single-model days for gte-Qwen2-1-5B-instruct.
-    TODO: expand as data quality improves.
+    Compute monthly peak energy and top 5 quarterly peaks per Voie.
+
+    Parameters
+    ----------
+    energy_df : energy dataframe with Datetime, ID_Voie, energy_used columns
+
+    Returns
+    -------
+    monthly_peaks : DataFrame with ID_Voie, month, peak_energy_wh
+    top5_peaks    : DataFrame with ID_Voie, Datetime, peak_energy_wh for top 5 peaks
     """
-    # --- Aggregate energy to daily level ---
-    # TODO: if there is data availability of a lower time aggregation, model and idle energy can be accounted for
-    #       more precisely. Instead of aggregating to date, aggregate to datetime or skip this step if 5/10 minute
-    #       interval data available.
+    energy_df = energy_df.copy()
+    energy_df["month"] = energy_df["Datetime"].dt.to_period("M")
+
+    monthly_peaks = (
+        energy_df.groupby(["ID_Voie", "month"])["energy_used"]
+        .max()
+        .reset_index()
+        .rename(columns={"energy_used": "peak_energy_wh"})
+    )
+
+    top5_peaks = (
+        energy_df.nlargest(5, "energy_used")
+        [["ID_Voie", "Datetime", "energy_used"]]
+        .rename(columns={"energy_used": "peak_energy_wh"})
+        .reset_index(drop=True)
+    )
+
+    return monthly_peaks, top5_peaks
+
+
+def aggregate_energy_daily(energy_df):
+    """
+    Filter to relevant Voies and aggregate energy readings to daily level.
+
+    Parameters
+    ----------
+    energy_df : energy dataframe with Datetime, ID_Voie, energy_used columns
+
+    Returns
+    -------
+    energy_daily : DataFrame with date, total_energy_wh
+    energy_df    : filtered and date-annotated energy dataframe
+    """
+    energy_df = energy_df.copy()
     energy_df["date"] = energy_df["Datetime"].dt.tz_localize(None).dt.normalize()
     energy_df = energy_df[energy_df["ID_Voie"].isin(["101_J37_Voie1"])]
+
     energy_daily = (
         energy_df
         .groupby("date")
@@ -316,7 +354,23 @@ def estimate_wh_per_1000_tokens(energy_df, usage_df):
         .reset_index()
     )
 
-    # --- Attempt idle energy subtraction ---
+    return energy_daily, energy_df
+
+
+def apply_idle_subtraction(energy_daily, energy_df):
+    """
+    Subtract idle energy from total to estimate active energy consumption.
+    Currently disabled pending model run timestamp availability.
+
+    Parameters
+    ----------
+    energy_daily : daily aggregated energy DataFrame
+    energy_df    : interval-level energy DataFrame
+
+    Returns
+    -------
+    energy_daily : DataFrame with idle_energy_wh and active_energy_wh columns added
+    """
     idle_df = estimate_idle_energy(energy_df)
     if idle_df is not None:
         idle_daily = idle_df.groupby("date").agg(idle_energy_wh=("idle_energy_wh", "sum")).reset_index()
@@ -331,9 +385,25 @@ def estimate_wh_per_1000_tokens(energy_df, usage_df):
         energy_daily["active_energy_wh"] = energy_daily["total_energy_wh"]
         print("  [idle] Using total_energy_wh as proxy — estimate includes idle consumption (upper bound).")
 
-    # --- Fetch interval CO2 factors from RTE and match to energy readings ---
-    start = (energy_daily["date"].min() + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
-    end   = energy_df["Datetime"].dt.tz_localize(None).max().strftime("%Y-%m-%d")
+    return energy_daily
+
+
+def apply_co2_factors(energy_daily, energy_df):
+    """
+    Fetch 15-minute CO2 factors from RTE and attach energy-weighted daily
+    averages to the energy_daily DataFrame.
+
+    Parameters
+    ----------
+    energy_daily : daily aggregated energy DataFrame
+    energy_df    : interval-level energy DataFrame with Datetime column
+
+    Returns
+    -------
+    energy_daily : DataFrame with co2_g_per_kwh, co2_source, co2_kg columns added
+    """
+    start  = (energy_daily["date"].min() + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+    end    = energy_df["Datetime"].dt.tz_localize(None).max().strftime("%Y-%m-%d")
     co2_df = fetch_rte_co2_factor(start, end)
 
     # Match each 5-min energy reading to the last overlapping 15-min CO2 interval
@@ -359,99 +429,133 @@ def estimate_wh_per_1000_tokens(energy_df, usage_df):
     )
 
     energy_daily = energy_daily.merge(co2_daily, on="date", how="left")
-
-    # Convert Wh to kWh, multiply by gCO2/kWh, convert to kgCO2
     energy_daily["co2_kg"] = (energy_daily["active_energy_wh"] / 1000) * (energy_daily["co2_g_per_kwh"] / 1000)
 
-    # --- Normalise date column in usage data ---
+    return energy_daily
+
+
+def build_energy_daily(energy_df):
+    """
+    Full pipeline to produce a daily energy DataFrame with idle subtraction
+    and CO2 factors attached.
+
+    Parameters
+    ----------
+    energy_df : raw interval-level energy DataFrame
+
+    Returns
+    -------
+    energy_daily : DataFrame with date, total_energy_wh, idle_energy_wh,
+                   active_energy_wh, co2_g_per_kwh, co2_source, co2_kg
+    """
+    energy_daily, energy_df_filtered = aggregate_energy_daily(energy_df)
+    energy_daily = apply_idle_subtraction(energy_daily, energy_df_filtered)
+    energy_daily = apply_co2_factors(energy_daily, energy_df_filtered)
+
+    return energy_daily
+
+
+def merge_usage_and_energy(usage_df, energy_daily):
+    """
+    Join daily usage records with daily energy data on date.
+
+    Parameters
+    ----------
+    usage_df     : usage DataFrame with Date, Model, Total Tokens columns
+    energy_daily : daily energy DataFrame from build_energy_daily
+
+    Returns
+    -------
+    merged : usage_df joined with energy_daily with wh_per_1000_tokens
+             and co2_g_per_1000_tokens columns added
+    """
+    usage_df = usage_df.copy()
     usage_df["date"] = pd.to_datetime(usage_df["Date"]).dt.normalize()
 
-    # --- Join on date ---
     merged = usage_df.merge(energy_daily, on="date", how="left")
-
-    # --- Compute Wh per 1000 tokens using active energy ---
-    merged["wh_per_1000_tokens"] = (merged["active_energy_wh"] / merged["Total Tokens"]) * 1000
+    merged["wh_per_1000_tokens"]    = (merged["active_energy_wh"] / merged["Total Tokens"]) * 1000
     merged["co2_g_per_1000_tokens"] = (merged["co2_kg"] * 1000 / merged["Total Tokens"]) * 1000
 
-    # --- Peak analysis ---
-    monthly_peaks, top5_peaks = compute_peak_analysis(energy_df)
-    print("\n  [peaks] Monthly peaks per Voie:")
-    print(monthly_peaks.to_string(index=False))
-    print("\n  [peaks] Top 5 quarterly peaks:")
-    print(top5_peaks.to_string(index=False))
+    return merged
 
-    # --- Filter to clean estimation window: single-model days for gte-Qwen2-1-5B-instruct ---
+
+def estimate_wh_per_1000_tokens(merged_df):
+    """
+    Estimate Wh per 1000 tokens for the clean anchor model window.
+    Currently filtered to single-model days for gte-Qwen2-1-5B-instruct.
+    TODO: expand as data quality improves.
+
+    Parameters
+    ----------
+    merged_df : merged usage and energy DataFrame from merge_usage_and_energy
+
+    Returns
+    -------
+    overall_estimate : float, Wh per 1000 tokens for the anchor model
+    clean            : DataFrame filtered to the clean estimation window
+    """
     # TODO: remove this filter as more clean single-model days are identified
     clean_dates = pd.to_datetime(["2026-02-01", "2026-02-02"])
     clean_model = "gte-Qwen2-1-5B-instruct"
-    clean = merged[
-        (merged["date"].isin(clean_dates)) &
-        (merged["Model"] == clean_model)
+
+    clean = merged_df[
+        (merged_df["date"].isin(clean_dates)) &
+        (merged_df["Model"] == clean_model)
     ]
 
-    # --- Summary estimate ---
-    total_tokens = clean["Total Tokens"].sum()
-    total_energy = clean["active_energy_wh"].sum()
-    total_co2_kg = clean["co2_kg"].sum()
-    overall_estimate    = (total_energy / total_tokens) * 1000
+    overall_estimate = (clean["active_energy_wh"].sum() / clean["Total Tokens"].sum()) * 1000
+
+    return overall_estimate, clean
+
+
+def main():
+    df_usage = load_usage(fs, S3_BUCKET, USAGE_FILES)
+    df_energy = load_energy(fs, S3_BUCKET)
+
+    # --- Build daily energy with idle subtraction and CO2 ---
+    print("\n[1] Building daily energy and CO2 factors...")
+    energy_daily = build_energy_daily(df_energy)
+
+    # --- Merge usage and energy ---
+    print("\n[2] Merging usage and energy data...")
+    merged_df = merge_usage_and_energy(df_usage, energy_daily)
+
+    # --- Estimate Wh per 1000 tokens ---
+    print("\n[3] Estimating Wh per 1000 tokens...")
+    wh_per_1000, clean = estimate_wh_per_1000_tokens(merged_df)
+
+    total_tokens         = clean["Total Tokens"].sum()
+    total_energy         = clean["active_energy_wh"].sum()
+    total_co2_kg         = clean["co2_kg"].sum()
     overall_co2_per_1000 = (total_co2_kg * 1000 / total_tokens) * 1000
 
     print(clean[["date", "Model", "Total Tokens", "total_energy_wh", "active_energy_wh",
                  "wh_per_1000_tokens", "co2_kg", "co2_g_per_1000_tokens"]])
-    print(f"\n  Model: {clean_model}")
+    print(f"\n  Model: gte-Qwen2-1-5B-instruct")
     print(f"  Total Tokens:               {total_tokens:,}")
     print(f"  Total Energy (active):      {total_energy:,.1f} Wh")
-    print(f"  Estimate:                   {overall_estimate:.4f} Wh / 1000 tokens")
+    print(f"  Estimate:                   {wh_per_1000:.4f} Wh / 1000 tokens")
     print(f"  Total CO2:                  {total_co2_kg:.4f} kgCO2e")
     print(f"  CO2 Intensity:              {overall_co2_per_1000:.4f} gCO2e / 1000 tokens")
 
-    return merged, overall_estimate
+    # --- Peak analysis ---
+    print("\n[4] Peak analysis...")
+    monthly_peaks, top5_peaks = compute_peak_analysis(df_energy)
+    print("\n  Monthly peaks per Voie:")
+    print(monthly_peaks.to_string(index=False))
+    print("\n  Top 5 quarterly peaks:")
+    print(top5_peaks.to_string(index=False))
+
+    # --- Model parameter lookup ---
+    print("\n[5] Looking up model parameters (HuggingFace + fallback)...")
+    models = sorted(df_usage["Model"].unique())
+    params_map, excluded = build_params_map(models)
+    print(f"  Models with data: {len(params_map)} | Excluded: {len(excluded)}")
+
+    return merged_df, wh_per_1000, energy_daily, monthly_peaks, top5_peaks, params_map
 
 
-def compute_peak_analysis(energy_df):
-    """
-    Compute monthly peak energy and top 5 quarterly peaks per Voie.
-
-    Parameters
-    ----------
-    energy_df : energy dataframe with Datetime, ID_Voie, energy_used columns
-
-    Returns
-    -------
-    monthly_peaks : DataFrame with ID_Voie, month, peak_energy_wh
-    top5_peaks    : DataFrame with ID_Voie, Datetime, energy_used for top 5 peaks
-    """
-    energy_df = energy_df.copy()
-    energy_df["month"] = energy_df["Datetime"].dt.to_period("M")
-
-    monthly_peaks = (
-        energy_df.groupby(["ID_Voie", "month"])["energy_used"]
-        .max()
-        .reset_index()
-        .rename(columns={"energy_used": "peak_energy_wh"})
-    )
-
-    top5_peaks = (
-        energy_df.nlargest(5, "energy_used")
-        [["ID_Voie", "Datetime", "energy_used"]]
-        .rename(columns={"energy_used": "peak_energy_wh"})
-        .reset_index(drop=True)
-    )
-
-    return monthly_peaks, top5_peaks
-
-
-df_usage = load_usage(fs, S3_BUCKET, USAGE_FILES)
-df_energy = load_energy(fs, S3_BUCKET)
-
-result_df, wh_per_1000 = estimate_wh_per_1000_tokens(df_energy, df_usage)
-
-print(f"\n[2/6] Looking up model parameters "
-      f"{'(HuggingFace + fallback)'}")
-models = sorted(df_usage["Model"].unique())
-params_map, excluded = build_params_map(models)
-print(f"  Models with data : {len(params_map)} | Excluded : {len(excluded)}")
-
+merged_df, wh_per_1000, energy_daily, monthly_peaks, top5_peaks, params_map = main()
 
 ai_energy = pd.read_csv("https://raw.githubusercontent.com/Nidhal-Jegham/HowHungryisAIDashboard/main/output/artificialanalysis_environmental.csv")
 
@@ -494,40 +598,23 @@ aie_models = aie_models.drop(columns=metrics + ['variation']).drop_duplicates('b
     .merge(pivot_df, on='base_model', how='left')
 aie_models['model_name'] = aie_models['model_name'].str.replace(r'\smedium$', '', regex=True)
 
-"""
+
 
 df_usage.loc[df_usage['Model'] == "Llama-3-3-70B-128k", 'Task'] = 'Text_Generation'
-URL = 'https://huggingface.co/meta-llama/Meta-Llama-3-70B'
-df_usage.loc[df_usage['Model'] == 'Llama-3-3-70B-128k', 'HF_URL'] = URL
 
 df_usage.loc[df_usage['Model'] == "gptoss120b", 'Task'] = 'Reasoning'
-URL = 'https://huggingface.co/openai/gpt-oss-120b'
-df_usage.loc[df_usage['Model'] == 'gptoss120b', 'HF_URL'] = URL
 
 df_usage.loc[df_usage['Model'] == "gptoss20b", 'Task'] = 'Reasoning'
-URL = "https://huggingface.co/openai/gpt-oss-20b"
-df_usage.loc[df_usage['Model'] == 'gptoss20b', 'HF_URL'] = URL
 
 df_usage.loc[df_usage['Model'] == '/model/deepdml-faster-whisper-large-v3-turbo-ct2', 'Task'] = 'Automatic_Speech_Recognition'
-URL = 'https://huggingface.co/deepdml/faster-whisper-large-v3-turbo-ct2'
-df_usage.loc[df_usage['Model'] == '/model/deepdml-faster-whisper-large-v3-turbo-ct2', 'HF_URL'] = URL
 
 df_usage.loc[df_usage['Model'] == 'Qwen2.5-Coder-32B-Instruct-fp8-W8A16', 'Task'] = 'Text_Generation'
-URL = 'https://huggingface.co/Qwen/Qwen2.5-Coder-32B-Instruct'
-df_usage.loc[df_usage['Model'] == 'Qwen2.5-Coder-32B-Instruct-fp8-W8A16', 'HF_URL'] = URL
 
 df_usage.loc[df_usage['Model'] == 'gte-Qwen2-1-5B-instruct', 'Task'] = 'Sentence_Similarity'
-URL = 'https://huggingface.co/Alibaba-NLP/gte-Qwen2-1.5B-instruct'
-df_usage.loc[df_usage['Model'] == 'gte-Qwen2-1-5B-instruct', 'HF_URL'] = URL
 
 df_usage.loc[df_usage['Model'] == 'Mistral-Small-24B-Instruct-2501-FP8-dynamic', 'Task'] = 'Reasoning'
-URL = 'https://huggingface.co/mistralai/Mistral-Small-24B-Instruct-2501'
-df_usage.loc[df_usage['Model'] == 'Mistral-Small-24B-Instruct-2501-FP8-dynamic', 'HF_URL'] = URL
 
 df_usage.loc[df_usage['Model'] == 'dgfip-e5-large', 'Task'] = 'Sentence_Similarity'
-URL = 'https://huggingface.co/intfloat/e5-large'
-df_usage.loc[df_usage['Model'] == 'dgfip-e5-large', 'HF_URL'] = URL
-
 
 df_usage['AIE_name'] = df_usage['HF_URL'].str.split("/").str[-1]
 
@@ -539,3 +626,4 @@ df_usage.loc[df_usage['AIE_name'] == 'e5-large', 'AIE_name'] = "e5-large-v2"
 print(models)
 
 print(df_usage.head())
+"""
