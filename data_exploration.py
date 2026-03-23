@@ -20,25 +20,12 @@ install()
 
 from huggingface_hub import HfApi
 
-S3_BUCKET = "projet-datalab-depp-dgfip"
-USAGE_FILES = ["diane_usage_daily_with_models_fevrier.csv",
-               "diane_usage_daily_with_models_2026-01-28 (1).csv"]
+"""
+TODO: Add the files here, or set up an automatic pool to pull usage and energy data
+"""
+USAGE_FILES = ["usage_file_MM_1.csv",
+               "usage_file_MM_2.csv"]
 OUTPUT_CSV = None
-
-"""
-Comment out when publishing and add descriptions of how to establish connection to underlying data
-"""
-
-os.environ["AWS_ACCESS_KEY_ID"] = '6JUTTZCSVX8TUV6TX10N'
-os.environ["AWS_SECRET_ACCESS_KEY"] = '4Y0LaYdkGgOXtfqP6FlcrCt3xBr+hs4YtJhKEYvy'
-os.environ["AWS_SESSION_TOKEN"] = 'eyJhbGciOiJIUzUxMiIsInR5cCI6IkpXVCJ9.eyJhY2Nlc3NLZXkiOiI2SlVUVFpDU1ZYOFRVVjZUWDEwTiIsImFjciI6IjAiLCJhbGxvd2VkLW9yaWdpbnMiOlsiKiJdLCJhdWQiOlsibWluaW8iLCJhY2NvdW50Il0sImF1dGhfdGltZSI6MTc3MzQ4NjQ4MSwiYXpwIjoib255eGlhLW1pbmlvIiwiZW1haWwiOiJyb2JlcnQucG93ZXJzQGVuc2FlLmZyIiwiZW1haWxfdmVyaWZpZWQiOnRydWUsImV4cCI6MTc3NDY5NzM0MywiZmFtaWx5X25hbWUiOiJQT1dFUlMiLCJnaXZlbl9uYW1lIjoiUm9iZXJ0IiwiZ3JvdXBzIjpbImRhdGFsYWItZGVwcC1kZ2ZpcCJdLCJpYXQiOjE3NzM0ODc3NDEsImlzcyI6Imh0dHBzOi8vYXV0aC5ncm91cGUtZ2VuZXMuZnIvcmVhbG1zL2dlbmVzIiwianRpIjoiMWY3NDA4OWQtZDg4Yi00NzMxLThhNTUtNzQzZWEyYzQ5Zjg4IiwibmFtZSI6IlJvYmVydCBQT1dFUlMiLCJwb2xpY3kiOiJzdHNvbmx5IiwicHJlZmVycmVkX3VzZXJuYW1lIjoicnBvd2Vycy1lbnNhZSIsInJlYWxtX2FjY2VzcyI6eyJyb2xlcyI6WyJvZmZsaW5lX2FjY2VzcyIsImRlZmF1bHQtcm9sZXMtZ2VuZXMiLCJ1bWFfYXV0aG9yaXphdGlvbiJdfSwicmVzb3VyY2VfYWNjZXNzIjp7ImFjY291bnQiOnsicm9sZXMiOlsibWFuYWdlLWFjY291bnQiLCJtYW5hZ2UtYWNjb3VudC1saW5rcyIsInZpZXctcHJvZmlsZSJdfX0sInNjb3BlIjoib3BlbmlkIHByb2ZpbGUgZW1haWwiLCJzaWQiOiJmNmU1ZGRmMi1kYjE3LTRjZDEtOWE2NS0wOGQyZjc4ZjM3N2QiLCJzdWIiOiI2NzYzNDFlZC1mM2FlLTQzZDgtOTMzMS0zMTZjMzA4NDRlNjgiLCJ0eXAiOiJCZWFyZXIifQ.PjLM_zxZSLNu4kbEZ9VeV4R8WJsO3EOn2W3hn6y0Ylja8b_-qph7pD-I4jvJ4csac51GyGAEeuvbffPAdyVHLQ'
-os.environ["AWS_DEFAULT_REGION"] = 'us-east-1'
-
-fs = s3fs.S3FileSystem(
-    client_kwargs={'endpoint_url': 'https://'+'minio-simple.lab.groupe-genes.fr'},
-    key=os.environ["AWS_ACCESS_KEY_ID"],
-    secret=os.environ["AWS_SECRET_ACCESS_KEY"],
-    token=os.environ["AWS_SESSION_TOKEN"])
 
 # List of models matching DGFiP's data to HuggingFace ID
 MODEL_HF_REPO = {
