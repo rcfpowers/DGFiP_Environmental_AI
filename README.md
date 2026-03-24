@@ -4,10 +4,10 @@
 This repository contains the software and methodology developed to assess the environmental impact of the DGFiP’s Generative AI platform. This project is a collaboration between the DGFiP and students from the master *Data and Economics for public policy (DEPP)* from École Polytechnique, ENSAE and Télécom.
 
 ## Repository structure
-- **`data_exploration.py`**: This script automates the loading of iDRAC energy logs and LiteLLM usage data.
-- **`Per-Model Energy & CO₂ Estimation`**: A module (or logic within the main script) that applies weighted attribution to disaggregate energy use by specific LLMs. 
-- **`Data_description.ipynb`**: Descriptive statistics and visualizations of the raw data.
+- **`Per-Model Energy & CO₂ Estimation`**: This initial tool, as described in the report, applies weighted attribution to disaggregate energy use by specific LLMs.It enables a first overview of the energy consumption by model with the data that we had but is not precise. 
+- **`data_exploration.py`**: This is the monitoring tool that must be adapted following the instructions below, to enable a thorough energy assessment of the inference when access to the necessary data.
 - **`Hugging_face_model_cards`**: Logic used to query the Hugging Face API to retrieve model metadata (parameters, quantization) required for energy weight corrections.
+- **`Data_description.ipynb`**: Descriptive statistics and visualizations of the raw data.
 - **`Presentation_environmental_impact_assessment.pdf`**: The final summary slides detailing the Life-Cycle Assessment (LCA) results and strategic recommendations.
 - **`Report_environmental_impact_DGFiP.pdf`**: A detailed description of all the phases of the LCA (Life-Cycle Assessment), including methodology, tool results, and the full bibliography.
 
