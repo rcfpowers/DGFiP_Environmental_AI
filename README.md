@@ -8,8 +8,8 @@ This repository contains the software and methodology developed to assess the en
 - **`Per-Model Energy & CO₂ Estimation`**: A module (or logic within the main script) that applies weighted attribution to disaggregate energy use by specific LLMs. 
 - **`Data_description.ipynb`**: Descriptive statistics and visualizations of the raw data.
 - **`Hugging_face_model_cards`**: Logic used to query the Hugging Face API to retrieve model metadata (parameters, quantization) required for energy weight corrections.
-- **Presentation_environmental_impact_assessment.pdf**: The final summary slides detailing the Life-Cycle Assessment (LCA) results and strategic recommendations.
-- **Report_Environmental_Impact_DGFiP.pdf**: A detailed description of all the phases of the LCA (Life-Cycle Assessment), including methodology, tool results, and the full bibliography.
+- **`Presentation_environmental_impact_assessment.pdf`**: The final summary slides detailing the Life-Cycle Assessment (LCA) results and strategic recommendations.
+- **`Report_Environmental_Impact_DGFiP.pdf`**: A detailed description of all the phases of the LCA (Life-Cycle Assessment), including methodology, tool results, and the full bibliography.
 
 ## TO DO: Priority Improvements
 
