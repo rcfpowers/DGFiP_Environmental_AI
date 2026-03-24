@@ -1,114 +1,51 @@
-# DGFiP Model Energy Monitoring Tool
+# AI Energy & CO2 Monitoring Tool
+*Estimating energy consumption and carbon footprint of LLM inference*
+
+## Overview
+
+This tool estimates the energy consumption and CO2 emissions of large language model (LLM) inference at DGFiP. It does this by combining three data sources:
+
+- Model usage logs (tokens, requests, spend per team and model)
+- Data center energy readings (Wh, from physical sensors per server "Voie")
+- Real-time grid CO2 intensity (gCO2/kWh, from RTE éCO2mix)
+
+From these inputs, the tool produces per-model estimates of energy use (Wh per 1,000 tokens) and carbon footprint (gCO2e per 1,000 tokens), along with peak energy analysis and model parameter lookups from HuggingFace.
 
 ---
 
-## TODO: Priority Improvements
+## Step-by-Step Setup
 
-The following items must be addressed to move from a proof-of-concept to a production-grade energy monitoring system.
+### Step 1 — Clone the repository
 
-### 1. Data Infrastructure
+Open a terminal and run:
 
-1. **Configure data source paths for DGFiP's environment**
-   - Replace the hardcoded `USAGE_FILES` constants with environment variables or a config file
-   - Update `load_usage()` and `load_energy()` to point to the correct internal data paths
+```bash
+git clone <your-repository-url>
+cd <repository-folder>
+```
 
-2. **Provide model-level token and request data disaggregated by model and time period**
-   - Currently the usage CSV aggregates all models to a daily total, making per-model energy estimation impossible except on single-model days
-   - The usage source must expose: total tokens per model per hour (or finer), request counts per model, and ideally input vs. output token split
-
-3. **Provide model run timestamps at 5 minute-level granularity**
-   - Required to identify server idle periods and subtract idle energy from active energy
-   - Without this, the current estimate is an upper bound that overstates energy by up to ~10%
-   - Timestamps should record when each model starts and stops serving requests
-
-4. **Supply GPU-to-model assignment data**
-   - Current energy data comes from the PDU at the voie level, not per GPU
-   - If multiple models share a rack, their energy cannot be separated without knowing which GPU hosts which model
-   - Implement `nvidia-smi` polling or an orchestrator log that maps model name → GPU ID → voie
-
-### 2. GPU-Level Monitoring
-
-5. **Implement `nvidia-smi` integration**
-   - Replace PDU-level energy data with per-GPU power draw via `nvidia-smi --query-gpu=power.draw --format=csv,noheader`
-   - Log at 10-minute intervals minimum; 5-min preferred
-   - Capture both power draw (W) and memory utilisation (MiB) per GPU
-
-### 3. Idle Energy Estimation
-
-6. **Enable the `estimate_idle_energy()` function once run timestamps are available**
-   - The function body already exists but returns `None` with a warning
-   - Once model run start/stop times are available, uncomment the quantile-based idle baseline logic
-   - Validate by checking that idle power aligns with known server specs (e.g. H100 idle ~70 W)
-
-### 4. CO₂ and Geographic Scope
-
-7. **Switch to historical CO₂ data for reporting periods older than 1.5 months**
-   - The real-time RTE zip only covers the past ~6 weeks
-   - For analysis covering January 2026 or earlier, use the consolidated historical archive: `https://eco2mix.rte-france.com/download/eco2mix/eCO2mix_RTE_En-cours-Consolide.zip`
-   - Add a date-range check at the start of `fetch_rte_co2_factor()` to automatically choose the correct source
-
-### 5. Model Coverage
-
-8. **Add January 2026 usage data when it becomes available**
-   - No January data was included in this iteration; the `USAGE_FILES` list must be updated
-
-9. **Expand the energy estimate to all deployed models, not just `gte-Qwen2-1-5B-instruct`**
-    - `estimate_wh_per_1000_tokens()` currently hard-codes two specific dates and one model
-    - Once per-model hourly data is available, replace the `clean_dates` filter with a generalised loop over all models
-
-10. **Maintain and extend `MODEL_HF_REPO` and `MODEL_PARAMS_B_KNOWN` mappings**
-    - Any newly deployed model should be added to `MODEL_HF_REPO` if a HuggingFace equivalent exists
-    - If HuggingFace does not publish parameter counts (e.g. internal fine-tunes), add the count manually to `MODEL_PARAMS_B_KNOWN`
-
-### 6. Input/Output Token Split
-
-11. **Distinguish between input (prompt) and output (completion) tokens in usage data**
-    - Output tokens are significantly more energy-intensive to generate than input tokens
-    - The current estimate treats all tokens equally, which understates energy for generation-heavy workloads
-    - Request that the usage export includes `input_tokens` and `output_tokens` as separate columns
-
-### 7. Automation and Integration
-
-12. **Schedule the pipeline to run automatically**
-    - Write results to a persistent output location
-
-13. **Surface estimates in the model selection decision process**
-    - Feed Wh/1000 tokens and gCO₂e/1000 tokens into the model catalogue or deployment dashboard
-    - Consider a pre-deployment estimation step using HuggingFace metadata and benchmark data
+Replace `<your-repository-url>` with the actual URL of the repository.
 
 ---
 
-## 1. Overview
+### Step 2 — Make sure Python is installed
 
-This tool automates the collection, aggregation, and analysis of energy consumption and carbon emissions associated with large language models (LLMs) deployed by DGFiP on its on-premise GPU infrastructure. It was developed as part of a collaboration between Polytechnique Masters of DEPP and the DGFiP.
+This tool requires Python 3.9 or higher. Check your version with:
 
-The primary outputs are:
+```bash
+python --version
+```
 
-- **Wh / 1,000 tokens** — energy consumed per unit of LLM output
-- **gCO₂e / 1,000 tokens** — carbon emissions per unit of LLM output
-- Monthly and quarterly peak energy per voie
-- Model parameter counts (from HuggingFace API or hardcoded fallback)
-- Daily energy and CO₂ time series for each voie
+If Python is not installed, download it from: https://www.python.org/downloads/
 
 ---
 
-## 2. Architecture and Data Flow
+### Step 3 — Install the dependencies
 
-The pipeline is a single Python script that executes the following steps in sequence:
+All required packages are installed automatically when the script runs.
+They are: `pandas`, `numpy`, `matplotlib`, `huggingface_hub`, `boto3`, `s3fs`, `xlrd`.
 
-1. **Load usage data** — reads daily model usage CSVs from S3. Each row corresponds to one model on one day, providing total tokens, request counts, and spend.
-2. **Load energy data** — scans the S3 bucket for energy files matching the naming convention `NNN_XN_VoieN_YYYYMMDD.csv` and computes per-interval energy consumption (Wh) from cumulative Wh readings.
-3. **Build daily energy series** — filters to the relevant voie (currently hardcoded to `101_J37_Voie1`), aggregates to daily totals, subtracts idle energy if available, and attaches RTE CO₂ factors.
-4. **Merge usage and energy** — joins the daily energy series to the usage data on date, computing Wh per 1,000 tokens and gCO₂e per 1,000 tokens for each day.
-5. **Estimate anchor model efficiency** — isolates the two days in February 2026 where only a single model (`gte-Qwen2-1-5B-instruct`) was running, producing a clean estimate.
-6. **Peak analysis** — computes monthly maximum energy and the five highest energy intervals across the observation window.
-7. **Model parameter lookup** — queries the HuggingFace API for parameter counts; falls back to a hardcoded dictionary for models not listed there.
-
----
-
-## 3. Configuration and Setup
-
-### 3.1 Dependencies
+If you prefer to install them manually beforehand, run:
 
 ```bash
 pip install pandas numpy matplotlib huggingface_hub boto3 s3fs xlrd
@@ -116,13 +53,36 @@ pip install pandas numpy matplotlib huggingface_hub boto3 s3fs xlrd
 
 ---
 
-### Step 4 — Set your data file paths
+### Step 4 — Configure your AWS / S3 credentials
+
+The tool reads usage and energy data from an S3 bucket. You need valid AWS credentials configured on your machine. The recommended way is:
+
+```bash
+aws configure
+```
+
+You will be prompted for:
+- AWS Access Key ID
+- AWS Secret Access Key
+- Default region (e.g. `eu-west-1`)
+
+Alternatively, set environment variables directly in your terminal:
+
+```bash
+export AWS_ACCESS_KEY_ID=your_key_here
+export AWS_SECRET_ACCESS_KEY=your_secret_here
+```
+
+---
+
+### Step 5 — Set your data file paths
 
 Open the main script and update the following variables near the top of the file:
 
 | Variable | Description |
 |---|---|
 | `USAGE_FILES` | List of usage CSV filenames, e.g. `["usage_file_MM_1.csv", "usage_file_MM_2.csv"]` |
+| `S3_BUCKET` | Name of your S3 bucket, e.g. `"your-bucket-name"` |
 | `OUTPUT_CSV` | *(Optional)* Path to save merged results as CSV. Set to `None` to skip. |
 
 ---
@@ -165,15 +125,19 @@ Results are printed to the terminal. An energy plot is displayed and the energy 
 
 | File | Description |
 |---|---|
-| `merged_df` | Full DataFrame joining usage and energy data, with `wh_per_1000_tokens` and `co2_g_per_1000_tokens` columns |
-| `wh_per_1000` | Float, the anchor model Wh per 1,000 tokens estimate |
-| `energy_daily` | Daily energy DataFrame with CO₂ factors attached |
-| `monthly_peaks` | Monthly maximum energy per voie |
-| `top5_peaks` | Five highest energy intervals across the observation window |
-| `params_map` | Dictionary of model name → parameter count in billions |
-
-The script also writes `energy.csv` to `/home/onyxia/work/` and produces a matplotlib time-series plot of energy by voie during `load_energy()`.
+| `main.py` | Main script (entry point) |
+| `README.md` | This file |
+| `TECHNICAL_DOC.txt` | Function reference, assumptions, and limitations |
+| `energy.csv` | Output energy data (generated at runtime) |
 
 ---
 
-## 8. Contact and Ownership This tool was developed by the ENSAE/DEPP team in collaboration with the DGFiP Datalab. For questions about the methodology, data pipeline, or energy estimation approach, contact the robert.powers@polytechnique.edu, anne.thebaud@polytechnique.edu, margot.martin@polytechnique.edu, or letizia.gaggiotti@polytechnique.edu.
+## Data Sources
+
+- **RTE éCO2mix (real-time):** https://eco2mix.rte-france.com/download/eco2mix/eCO2mix_RTE_En-cours-TR.zip
+- **RTE éCO2mix (historical):** https://eco2mix.rte-france.com/download/eco2mix/eCO2mix_RTE_En-cours-Consolide.zip
+- **HuggingFace model metadata:** https://huggingface.co
+
+## Contact 
+
+For questions about the methodology, data pipeline, or energy estimation approach, contact robert.powers@polytechnique.edu, anne.thebaud@polytechnique.edu, margot.martin@polytechnique.edu, or letizia.gaggiotti@polytechnique.edu.
