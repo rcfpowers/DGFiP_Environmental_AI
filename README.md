@@ -1,6 +1,24 @@
 # AI Energy & CO2 Monitoring Tool
 *Estimating energy consumption and carbon footprint of LLM inference*
 
+This repository contains the software and methodology developed to assess the environmental impact of the DGFiP’s Generative AI platform. This project is a collaboration between the DGFiP and students from the master *Data and Economics for public policy (DEPP)* from École Polytechnique, ENSAE and Télécom.
+
+## Repository Structure
+
+- **`Ex Post Model Estimation/`** — Code to estimate model energy consumption with available usage and energy data. The following README is tailored to this folder, as it was the main deliverable of the project.
+  - **`monitoring_tool.py`** — Automates the loading of iDRAC energy logs and LiteLLM usage data.
+
+- **`Data Discovery/`** — Code to obtain a high-level understanding of usage and energy data.
+  - **`Data_description.ipynb`** — Descriptive statistics and visualizations of the raw data.
+
+- **`Ex Ante Model Estimation/`** — Code to estimate model energy consumption based on model characteristics, typically pulled from HuggingFace API.
+  - **`Per-Model Energy & CO₂ Estimation/`** — Applies weighted attribution to disaggregate energy use by specific LLMs.
+  - **`Hugging_face_model_cards/`** — Queries the HuggingFace API to retrieve model metadata (parameters, quantization) required for energy weight corrections.
+
+- **`Documentation/`** — All written documentation of this project, including limitations, assumptions, and recommendations.
+  - **`Presentation_environmental_impact_assessment.pdf`** — Final summary slides detailing the Life-Cycle Assessment (LCA) results and strategic recommendations.
+  - **`Report_Environmental_Impact_DGFiP.pdf`** — Detailed description of all LCA phases, including methodology, tool results, and full bibliography.
+
 > **Scope:** This README covers the **ex post** estimation pipeline implemented in
 > [`ex_post_model_estimation/Monitoring_tool.py`](ex_post_model_estimation/Monitoring_tool.py).
 > The ex-ante estimation is not covered here, but the code is included in the repository for future reference.
