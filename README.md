@@ -2,10 +2,10 @@
 *Estimating energy consumption and carbon footprint of LLM inference*
 
 > **Scope:** This README covers the **ex post** estimation pipeline implemented in
-> [`DGFiP_Environmental_AI/ex_post_model_estimation/Monitoring_tool.py`](DGFiP_Environmental_AI/ex_post_model_estimation/Monitoring_tool.py).
+> [`ex_post_model_estimation/Monitoring_tool.py`](ex_post_model_estimation/Monitoring_tool.py).
 > The ex-ante estimation is not covered here, but the code is included in the repository for future reference.
 
-📋 [TODO](DGFiP_Environmental_AI/Report and Presentation/TODO.md) &nbsp;|&nbsp; 📖 [Technical Documentation](DGFiP_Environmental_AI/Report and Presentation/DOCUMENTATION.md)
+📋 [TODO](Report and Presentation/TODO.md) &nbsp;|&nbsp; 📖 [Technical Documentation](Report and Presentation/DOCUMENTATION.md)
 
 ---
 
