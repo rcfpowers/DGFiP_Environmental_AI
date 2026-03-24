@@ -1,6 +1,14 @@
 # AI Energy & CO2 Monitoring Tool
 *Estimating energy consumption and carbon footprint of LLM inference*
 
+> **Scope:** This README covers the **ex post** estimation pipeline implemented in
+> [`DGFiP_Environmental_AI/ex_post_model_estimation/Monitoring_tool.py`](DGFiP_Environmental_AI/ex_post_model_estimation/Monitoring_tool.py).
+> The ex-ante estimation is not covered here, but the code is included in the repository for future reference.
+
+📋 [TODO](DGFiP_Environmental_AI/Report and Presentation/TODO.md) &nbsp;|&nbsp; 📖 [Technical Documentation](DGFiP_Environmental_AI/Report and Presentation/DOCUMENTATION.md)
+
+---
+
 ## Overview
 
 This tool estimates the energy consumption and CO2 emissions of large language model (LLM) inference at DGFiP. It does this by combining three data sources:
@@ -137,6 +145,7 @@ Results are printed to the terminal. An energy plot is displayed and the energy 
 - **RTE éCO2mix (real-time):** https://eco2mix.rte-france.com/download/eco2mix/eCO2mix_RTE_En-cours-TR.zip
 - **RTE éCO2mix (historical):** https://eco2mix.rte-france.com/download/eco2mix/eCO2mix_RTE_En-cours-Consolide.zip
 - **HuggingFace model metadata:** https://huggingface.co
+
 
 ## Contact 
 
