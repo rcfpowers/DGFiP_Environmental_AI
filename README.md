@@ -5,7 +5,7 @@
 > [`ex_post_model_estimation/Monitoring_tool.py`](ex_post_model_estimation/Monitoring_tool.py).
 > The ex-ante estimation is not covered here, but the code is included in the repository for future reference.
 
-📋 [TODO](Report and Presentation/TODO.md) &nbsp;|&nbsp; 📖 [Technical Documentation](Report and Presentation/DOCUMENTATION.md)
+[TODO](Report%20and%20Presentation/TODO.md) &nbsp;|&nbsp; [Technical Documentation](Report%20and%20Presentation/DOCUMENTATION.md)
 
 ---
 
