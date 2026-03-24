@@ -2,7 +2,7 @@
 
 ---
 
-## TODO: Priority Improvements
+## TO DO: Priority Improvements
 
 The following items must be addressed to move from a proof-of-concept to a production-grade energy monitoring system.
 
