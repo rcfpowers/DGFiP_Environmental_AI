@@ -248,4 +248,4 @@ The script also writes `energy.csv` to `/home/onyxia/work/` and produces a matpl
 ---
 
 ## 8. Contact and Ownership 
-# This tool was developed by the ENSAE/DEPP team in collaboration with the DGFiP Datalab. For questions about the methodology, data pipeline, or energy estimation approach, contact the robert.powers@polytechnique.edu, anne.thebaud@polytechnique.edu, margot.martin@polytechnique.edu, or letizia.gaggiotti@polytechnique.edu.
+### This tool was developed by the ENSAE/DEPP team in collaboration with the DGFiP Datalab. For questions about the methodology, data pipeline, or energy estimation approach, contact the robert.powers@polytechnique.edu, anne.thebaud@polytechnique.edu, margot.martin@polytechnique.edu, or letizia.gaggiotti@polytechnique.edu.
