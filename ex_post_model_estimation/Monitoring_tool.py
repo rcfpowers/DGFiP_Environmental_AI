@@ -1,7 +1,6 @@
 import subprocess
 import sys
 import os
-import s3fs
 import pandas as pd
 import matplotlib.pyplot as plt
 import re
@@ -11,7 +10,7 @@ import io
 
 
 def install():
-    pkgs = ["pandas", "numpy", "matplotlib", "huggingface_hub", "boto3", "s3fs", "xlrd"]
+    pkgs = ["pandas", "numpy", "matplotlib", "huggingface_hub", "boto3", "xlrd"]
     print("Installing dependencies...")
     subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet"] + pkgs)
 
@@ -25,6 +24,8 @@ TODO: Add the files here, or set up an automatic pool to pull usage and energy d
 """
 USAGE_FILES = ["usage_file_MM_1.csv",
                "usage_file_MM_2.csv"]
+ENERGY_FILES = ["energy_file_MM_1.csv",
+                "energy_file_MM_2.csv"]
 OUTPUT_CSV = None
 
 # List of models matching DGFiP's data to HuggingFace ID
@@ -144,15 +145,13 @@ def fetch_rte_co2_factor(start_date, end_date, fallback_gco2_per_kwh=17.0):
         })
 
 
-def load_usage(fs, bucket, files):
+def load_usage(files):
     """
-    Pulls then reformats model usage data from the S3 bucket
+    Pulls then reformats model usage data
     TODO: need to change to the data sources locations for DGFiP
 
     Parameters
     ----------
-    fs : S3FileSystem
-    bucket : str, location of files
     files: list of str, name of each csv file
 
     Returns
@@ -162,8 +161,7 @@ def load_usage(fs, bucket, files):
     """
     dfs = []
     for f in files:
-        print(f"  Reading: s3://{bucket}/{f}")
-        with fs.open(f"{bucket}/{f}") as fh:
+        with open(f"{f}") as fh:
             dfs.append(pd.read_csv(fh))
     usage = pd.concat(dfs, ignore_index=True)
     usage.columns = usage.columns.str.strip()
@@ -176,9 +174,9 @@ def load_usage(fs, bucket, files):
     return usage
 
 
-def load_energy(fs, bucket):
+def load_energy(files):
     """
-    Pulls then reformats data center energy data from the S3 bucket
+    Pulls then reformats data center energy data
 
     Will pull all csv files with the naming convention
     [3_Digit_Number]_[Letter][Digit]_[Voie]_[YYYYMMDD]
@@ -187,22 +185,20 @@ def load_energy(fs, bucket):
 
     Parameters
     ----------
-    fs : S3FileSystem
-    bucket : str, location of files
+    files: list of str, name of each csv file
 
     Returns
     -------
     usage : DataFrame with columns [source_file, Datetime, ID_Voie, energy_used]
     """
     pattern = re.compile(r"^\d{3}_[A-Za-z]\d+_Voie\d+_\d{8}\.csv$")
-    all_files = fs.ls(bucket)
-    energy_files = [f for f in all_files if pattern.match(os.path.basename(f))]
+    energy_files = [f for f in files if pattern.match(os.path.basename(f))]
 
     print(f"  Found {len(energy_files)} energy files matching naming convention")
 
     dfs = []
     for f in energy_files:
-        with fs.open(f) as fh:
+        with open(f) as fh:
             df = pd.read_csv(fh, skiprows=1)
         df["timestamp"] = pd.to_datetime(df["Time (UTC)"])
         df["source_file"] = os.path.basename(f)
@@ -554,8 +550,8 @@ def estimate_wh_per_1000_tokens(merged_df):
 
 
 def main():
-    df_usage = load_usage(fs, S3_BUCKET, USAGE_FILES)
-    df_energy = load_energy(fs, S3_BUCKET)
+    df_usage = load_usage(USAGE_FILES)
+    df_energy = load_energy(ENERGY_FILES)
 
     print("\n[1] Building daily energy and CO2 factors...")
     energy_daily = build_energy_daily(df_energy)

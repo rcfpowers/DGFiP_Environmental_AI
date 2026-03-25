@@ -69,12 +69,12 @@ If Python is not installed, download it from: https://www.python.org/downloads/
 ### Step 3 — Install the dependencies
 
 All required packages are installed automatically when the script runs.
-They are: `pandas`, `numpy`, `matplotlib`, `huggingface_hub`, `boto3`, `s3fs`, `xlrd`.
+They are: `pandas`, `numpy`, `matplotlib`, `huggingface_hub`, `boto3`, `xlrd`.
 
 If you prefer to install them manually beforehand, run:
 
 ```bash
-pip install pandas numpy matplotlib huggingface_hub boto3 s3fs xlrd
+pip install pandas numpy matplotlib huggingface_hub boto3 xlrd
 ```
 
 ---
@@ -92,7 +92,7 @@ Open the main script and update the following variables near the top of the file
 
 ### Step 5 — Check the energy file naming convention
 
-Energy files are automatically discovered in the S3 bucket. They must follow this exact naming pattern:
+Energy files are automatically discovered in local directory. They must follow this exact naming pattern:
 
 ```
 [3 digits]_[Letter][Digit]_Voie[Digit]_[YYYYMMDD].csv
@@ -113,7 +113,7 @@ python main.py
 ```
 
 The script will:
-1. Load usage and energy data from S3
+1. Load usage and energy data from local directory
 2. Fetch real-time CO2 factors from RTE éCO2mix (falls back to 17 gCO2/kWh if the download fails)
 3. Compute daily energy totals and merge with usage data
 4. Estimate Wh per 1,000 tokens for the anchor model window

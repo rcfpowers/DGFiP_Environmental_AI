@@ -2,8 +2,8 @@
 
 The pipeline is a single Python script that executes the following steps in sequence:
 
-1. **Load usage data** — reads daily model usage CSVs from S3. Each row corresponds to one model on one day, providing total tokens, request counts, and spend.
-2. **Load energy data** — scans the S3 bucket for energy files matching the naming convention `NNN_XN_VoieN_YYYYMMDD.csv` and computes per-interval energy consumption (Wh) from cumulative Wh readings.
+1. **Load usage data** — reads daily model usage CSVs from local directory. Each row corresponds to one model on one day, providing total tokens, request counts, and spend.
+2. **Load energy data** — scans the local directory for energy files matching the naming convention `NNN_XN_VoieN_YYYYMMDD.csv` and computes per-interval energy consumption (Wh) from cumulative Wh readings.
 3. **Build daily energy series** — filters to the relevant voie (currently hardcoded to `101_J37_Voie1`), aggregates to daily totals, subtracts idle energy if available, and attaches RTE CO₂ factors.
 4. **Merge usage and energy** — joins the daily energy series to the usage data on date, computing Wh per 1,000 tokens and gCO₂e per 1,000 tokens for each day.
 5. **Estimate anchor model efficiency** — isolates the two days in February 2026 where only a single model (`gte-Qwen2-1-5B-instruct`) was running, producing a clean estimate.
