@@ -46,11 +46,9 @@ From these inputs, the tool produces per-model estimates of energy use (Wh per 1
 Open a terminal and run:
 
 ```bash
-git clone <your-repository-url>
-cd <repository-folder>
+git clone https://github.com/rcfpowers/DGFiP_Environmental_AI.git
+cd DGFiP_Environmental_AI
 ```
-
-Replace `<your-repository-url>` with the actual URL of the repository.
 
 ---
 
