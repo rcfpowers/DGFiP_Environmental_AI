@@ -50,6 +50,7 @@ git clone https://github.com/rcfpowers/DGFiP_Environmental_AI.git
 cd DGFiP_Environmental_AI
 ```
 
+
 ---
 
 ### Step 2 — Make sure Python is installed
@@ -79,11 +80,12 @@ pip install pandas numpy matplotlib huggingface_hub boto3 xlrd
 
 ### Step 4 — Set your data file paths
 
-Open the main script and update the following variables near the top of the file:
+Open **`monitoring_tool.py`** and update the following variables near the top of the file:
 
 | Variable | Description |
 |---|---|
 | `USAGE_FILES` | List of usage CSV filenames, e.g. `["usage_file_MM_1.csv", "usage_file_MM_2.csv"]` |
+| `ENERGY_FILES` | List of usage CSV filenames, e.g. `["energy_file_MM_1.csv", "energy_file_MM_2.csv"]` |
 | `OUTPUT_CSV` | *(Optional)* Path to save merged results as CSV. Set to `None` to skip. |
 
 ---
@@ -107,7 +109,7 @@ Files that do not match this pattern will be ignored.
 From the repository folder, run:
 
 ```bash
-python main.py
+python monitoring_tool.py
 ```
 
 The script will:
@@ -118,18 +120,7 @@ The script will:
 5. Run peak energy analysis (monthly peaks + top 5 quarterly peaks)
 6. Look up model parameter counts from HuggingFace
 
-Results are printed to the terminal. An energy plot is displayed and the energy data is saved to `/home/onyxia/work/energy.csv`.
-
----
-
-## Project Structure
-
-| File | Description |
-|---|---|
-| `main.py` | Main script (entry point) |
-| `README.md` | This file |
-| `TECHNICAL_DOC.txt` | Function reference, assumptions, and limitations |
-| `energy.csv` | Output energy data (generated at runtime) |
+Results are printed to the terminal. An energy plot is displayed and the energy data is saved to `energy.csv`.
 
 ---
 

@@ -5,7 +5,7 @@ The following items must be addressed to move from a proof-of-concept to a produ
 ### 1. Data Infrastructure
 
 1. **Configure data source paths for DGFiP's environment**
-   - Replace the hardcoded `USAGE_FILES` constants with environment variables or a config file
+   - Replace the hardcoded `USAGE_FILES` and `ENERGY_FILES` constants with environment variables or a config file
    - Update `load_usage()` and `load_energy()` to point to the correct internal data paths
 
 2. **Provide model-level token and request data disaggregated by model and time period**
